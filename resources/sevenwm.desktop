@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=seven
+Comment=A tiling region on an infinite canvas
+Exec=sevenwm-session
+Type=Application
+DesktopNames=sevenwm

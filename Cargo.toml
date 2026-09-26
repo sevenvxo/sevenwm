@@ -1,0 +1,30 @@
+[package]
+name = "sevenwm"
+version = "0.1.0"
+edition = "2024"
+description = "A Wayland compositor"
+
+[dependencies]
+# pinned to the smithay rev that builds here bc winit beta.3 prolly breaks it so keep the lock on 0.31.0-beta.2
+smithay = { git = "https://github.com/Smithay/smithay.git", rev = "79bbed5e1199090d787115614847a79c76607181", default-features = false, features = [
+    "backend_winit",
+    "backend_udev",
+    "backend_drm",
+    "backend_gbm",
+    "backend_libinput",
+    "backend_session_libseat",
+    "backend_egl",
+    "renderer_gl",
+    "wayland_frontend",
+    "desktop",
+] }
+smithay-drm-extras = { git = "https://github.com/Smithay/smithay.git", rev = "79bbed5e1199090d787115614847a79c76607181" }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+swash = "0.2"
+toml = "0.8"
+tracing = "0.1"
+xcursor = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -1,0 +1,11 @@
+#!/bin/sh
+# starts sevenwm as a login session w ~/.local/bin on the path and logs to ~/.local/state/sevenwm/sevenwm.log
+case ":$PATH:" in
+    *":$HOME/.local/bin:"*) ;;
+    *) PATH="$HOME/.local/bin:$PATH" ;;
+esac
+export PATH
+state="${XDG_STATE_HOME:-$HOME/.local/state}/sevenwm"
+mkdir -p "$state"
+[ -f "$state/sevenwm.log" ] && mv -f "$state/sevenwm.log" "$state/sevenwm.log.old"
+exec sevenwm "$@" 2>>"$state/sevenwm.log"

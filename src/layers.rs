@@ -1,0 +1,172 @@
+//! layer shell for panels launchers notifications and wallpapers that sit around the windows
+
+use smithay::desktop::{LayerSurface, PopupKind, WindowSurfaceType, layer_map_for_output};
+use smithay::output::Output;
+use smithay::reexports::wayland_server::Resource;
+use smithay::reexports::wayland_server::protocol::{wl_output::WlOutput, wl_surface::WlSurface};
+use smithay::utils::{Logical, Point};
+use smithay::wayland::compositor::with_states;
+use smithay::wayland::shell::wlr_layer::{
+    KeyboardInteractivity, Layer, LayerSurface as WlrLayerSurface, LayerSurfaceData,
+    WlrLayerShellHandler, WlrLayerShellState,
+};
+use smithay::wayland::shell::xdg::PopupSurface;
+
+use crate::state::Seven;
+
+impl WlrLayerShellHandler for Seven {
+    fn shell_state(&mut self) -> &mut WlrLayerShellState {
+        &mut self.layer_shell_state
+    }
+
+    fn new_layer_surface(
+        &mut self,
+        surface: WlrLayerSurface,
+        output: Option<WlOutput>,
+        _layer: Layer,
+        namespace: String,
+    ) {
+        let Some(output) = output
+            .as_ref()
+            .and_then(Output::from_resource)
+            // none named so use the monitor in use
+            .or_else(|| self.pointer_monitor())
+            .or_else(|| self.space.outputs().next().cloned())
+        else {
+            tracing::warn!("layer surface '{namespace}' has no output to go on");
+            return;
+        };
+        tracing::info!("layer surface opened: {namespace}");
+        let mut map = layer_map_for_output(&output);
+        if let Err(err) = map.map_layer(&LayerSurface::new(surface, namespace)) {
+            tracing::warn!("failed to map layer surface: {err}");
+        }
+    }
+
+    fn new_popup(&mut self, _parent: WlrLayerSurface, popup: PopupSurface) {
+        // menus from panels like a tray icons right click menu
+        self.keep_popup_on_screen(&popup);
+        if let Err(err) = self.popups.track_popup(PopupKind::Xdg(popup)) {
+            tracing::warn!("failed to track layer popup: {err}");
+        }
+    }
+
+    fn layer_destroyed(&mut self, surface: WlrLayerSurface) {
+        let wl_surface = surface.wl_surface().clone();
+        let mut picker = false;
+        for output in self.space.outputs() {
+            let mut map = layer_map_for_output(output);
+            let layer = map
+                .layers()
+                .find(|l| l.layer_surface() == &surface)
+                .cloned();
+            if let Some(layer) = layer {
+                picker |= layer.namespace() == crate::capture::PICKER_NAMESPACE;
+                map.unmap_layer(&layer);
+            }
+        }
+        if picker {
+            self.picker_closed();
+        }
+        self.layers_focused.retain(|id| *id != wl_surface.id());
+        // a closing launcher gives the keyboard back to the last window
+        let focused = self.seat.get_keyboard().and_then(|k| k.current_focus());
+        if focused.as_ref() == Some(&wl_surface) || focused.is_none() {
+            let next = self.most_recent_window();
+            self.focus(next.as_ref());
+        }
+    }
+}
+
+impl Seven {
+    /// a commit on a layer surface so lay things out and give it the keyboard if it wants it
+    pub fn layer_commit(&mut self, surface: &WlSurface) {
+        let Some(output) = self.space.outputs().find(|o| {
+            layer_map_for_output(o)
+                .layer_for_surface(surface, WindowSurfaceType::TOPLEVEL)
+                .is_some()
+        }) else {
+            return;
+        };
+        let output = output.clone();
+        let layer = {
+            let mut map = layer_map_for_output(&output);
+            // arrange first so the configure has the right size
+            map.arrange();
+            map.layer_for_surface(surface, WindowSurfaceType::TOPLEVEL)
+                .cloned()
+        };
+        let Some(layer) = layer else {
+            return;
+        };
+
+        let configured = with_states(surface, |states| {
+            states
+                .data_map
+                .get::<LayerSurfaceData>()
+                .is_some_and(|data| data.lock().unwrap().initial_configure_sent)
+        });
+        if !configured {
+            layer.layer_surface().send_configure();
+            return;
+        }
+
+        if wants_keyboard(&layer) && !self.layers_focused.contains(&surface.id()) {
+            self.layers_focused.push(surface.id());
+            self.focus_layer(&layer);
+        }
+    }
+
+    pub fn focus_layer(&mut self, layer: &LayerSurface) {
+        // behind the lock only the lock screen gets keys
+        if self.is_locked() {
+            return;
+        }
+        let keyboard = self.seat.get_keyboard().expect("the seat has a keyboard");
+        let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+        keyboard.set_focus(self, Some(layer.wl_surface().clone()), serial);
+    }
+
+    /// a top layer that grabbed the keyboard like an open launcher
+    pub fn exclusive_layer(&self) -> Option<LayerSurface> {
+        self.space.outputs().find_map(|o| {
+            let map = layer_map_for_output(o);
+            map.layers()
+                .rev()
+                .find(|l| {
+                    matches!(l.layer(), Layer::Top | Layer::Overlay)
+                        && l.cached_state().keyboard_interactivity
+                            == KeyboardInteractivity::Exclusive
+                })
+                .cloned()
+        })
+    }
+
+    /// the layer surface under a screen point topmost first
+    pub fn layer_surface_under(
+        &self,
+        screen: Point<f64, Logical>,
+        layers: &[Layer],
+    ) -> Option<(LayerSurface, WlSurface, Point<f64, Logical>)> {
+        let output = self.output.as_ref()?;
+        let map = layer_map_for_output(output);
+        layers.iter().find_map(|&layer| {
+            let hit = map.layer_under(layer, screen)?;
+            let layer_loc = map.layer_geometry(hit)?.loc;
+            hit.surface_under(screen - layer_loc.to_f64(), WindowSurfaceType::ALL)
+                .map(|(surface, offset)| (hit.clone(), surface, (offset + layer_loc).to_f64()))
+        })
+    }
+
+    /// does the layout thing for every outputs layers again
+    pub fn arrange_layers(&self) {
+        for output in self.space.outputs() {
+            layer_map_for_output(output).arrange();
+        }
+    }
+}
+
+/// whether a layer surface takes the keyboard when it opens
+pub fn wants_keyboard(layer: &LayerSurface) -> bool {
+    layer.cached_state().keyboard_interactivity != KeyboardInteractivity::None
+}
