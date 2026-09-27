@@ -13,10 +13,12 @@ use smithay::reexports::wayland_server::{Client, Resource};
 use smithay::utils::{IsAlive, Serial};
 use smithay::utils::{Logical, Point, Rectangle};
 use smithay::wayland::buffer::BufferHandler;
+use smithay::reexports::calloop::Interest;
 use smithay::wayland::compositor::{
-    CompositorClientState, CompositorHandler, CompositorState, get_parent, is_sync_subsurface,
-    with_states,
+    BufferAssignment, CompositorClientState, CompositorHandler, CompositorState, SurfaceAttributes,
+    add_blocker, add_pre_commit_hook, get_parent, is_sync_subsurface, with_states,
 };
+use smithay::wayland::dmabuf::get_dmabuf;
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier};
 use smithay::wayland::fractional_scale::{FractionalScaleHandler, with_fractional_scale};
 use smithay::wayland::output::OutputHandler;
@@ -53,6 +55,37 @@ impl CompositorHandler for Seven {
             .get_data::<ClientState>()
             .expect("every client is inserted with ClientState")
             .compositor_state
+    }
+
+    /// hold each commit till the gpu finished drawing its dmabuf or we show half drawn frames
+    fn new_surface(&mut self, surface: &WlSurface) {
+        add_pre_commit_hook::<Self, _>(surface, |state, _, surface| {
+            // pending bc by commit() its already current and too late to block
+            let dmabuf = with_states(surface, |states| {
+                match states.cached_state.get::<SurfaceAttributes>().pending().buffer.as_ref() {
+                    Some(BufferAssignment::NewBuffer(buffer)) => get_dmabuf(buffer).cloned().ok(),
+                    _ => None,
+                }
+            });
+            let Some(dmabuf) = dmabuf else { return };
+            let Ok((blocker, source)) = dmabuf.generate_blocker(Interest::READ) else {
+                return;
+            };
+            let Some(client) = surface.client() else { return };
+            let inserted = state
+                .loop_handle
+                .insert_source(source, move |_, _, state: &mut Seven| {
+                    if let Some(data) = client.get_data::<ClientState>() {
+                        let display = state.display_handle.clone();
+                        data.compositor_state.blocker_cleared(state, &display);
+                    }
+                    Ok(())
+                })
+                .is_ok();
+            if inserted {
+                add_blocker(surface, blocker);
+            }
+        });
     }
 
     /// a client finished updating a surface so grab its buffer and answer a first commit w a configure
