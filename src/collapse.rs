@@ -28,6 +28,8 @@ pub struct Collapsed {
     pub rect: Rect,
     /// the workspace it was tiled in by number
     pub workspace: Option<u32>,
+    /// its spot in that workspaces tile order and its split so it comes back the same
+    pub tile: Option<(usize, f64)>,
     /// the uhhh marker middle on the canvas
     pub anchor: Point<f64, Logical>,
     pub image: MemoryRenderBuffer,
@@ -102,6 +104,10 @@ impl Seven {
         }
         let rect = self.frame(window).unwrap_or(rect);
         let workspace = self.ws_of(window).map(|i| self.workspaces[i].number);
+        let tile = self.ws_of(window).and_then(|i| {
+            let tiled = &self.workspaces[i].tiled;
+            tiled.iter().position(|(w, _)| w == window).map(|k| (k, tiled[k].1))
+        });
         let anchor = match self.ws_of(window) {
             // tiles wait in a row right below their workspace
             Some(i) => {
@@ -138,6 +144,7 @@ impl Seven {
             window: window.clone(),
             rect,
             workspace,
+            tile,
             anchor,
             image,
         });
@@ -155,9 +162,16 @@ impl Seven {
         };
         let entry = self.collapsed.remove(i);
         self.place_frame(window, entry.rect.loc, true);
-        match entry.workspace.and_then(|n| self.ws_index(n)) {
-            Some(ws) => self.tile_into(window, ws),
-            None => self.resize_window(window, entry.rect),
+        match (entry.workspace.and_then(|n| self.ws_index(n)), entry.tile) {
+            (Some(ws), Some((k, ratio))) if !self.is_tiled(window) => {
+                self.drop_maximized(window);
+                let tiled = &mut self.workspaces[ws].tiled;
+                tiled.insert(k.min(tiled.len()), (window.clone(), ratio));
+                self.retile_ws(ws);
+                self.restack();
+            }
+            (Some(ws), _) => self.tile_into(window, ws),
+            (None, _) => self.resize_window(window, entry.rect),
         }
         self.focus(Some(window));
         self.bring_into_view(window);

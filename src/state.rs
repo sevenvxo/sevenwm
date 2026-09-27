@@ -49,6 +49,8 @@ pub struct Seven {
     /// remembered windows and cameras and the last written session
     pub pending: Option<crate::session::Pending>,
     pub saved_monitors: Vec<crate::session::SavedMonitor>,
+    /// the saved session had no workspaces so monitors dont get a new one at startup
+    pub no_workspaces_saved: bool,
     pub session_saved: Option<crate::session::Session>,
     /// when a window was last open
     pub windows_seen: Instant,
@@ -120,6 +122,8 @@ pub struct Seven {
     pub font: Option<crate::text::Font>,
     /// in the overview the camera and zoom to go back to
     pub overview: Option<(Point<f64, Logical>, f64)>,
+    /// the window mod+q asked to close and where its middle was so focus goes to the nearest one after
+    pub closed_by_key: Option<(Window, Point<f64, Logical>)>,
     /// exec-outside launches still waiting for their window
     pub open_outside: Vec<Instant>,
     /// stable ids for the drawn outlines so redraws reuse them
@@ -276,6 +280,7 @@ impl Seven {
             gles_context: None,
             pending: None,
             saved_monitors: Vec::new(),
+            no_workspaces_saved: false,
             session_saved: None,
             windows_seen: Instant::now(),
             home: 1,
@@ -288,6 +293,7 @@ impl Seven {
             drop_target: None,
             dragging: None,
             overview: None,
+            closed_by_key: None,
             open_outside: Vec::new(),
             menu: None,
             submenu: None,

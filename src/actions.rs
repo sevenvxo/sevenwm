@@ -35,8 +35,11 @@ impl Seven {
                 self.spawn(&command);
             }
             Action::CloseWindow => {
-                if let Some(toplevel) = self.focused_window().and_then(|w| w.toplevel().cloned()) {
+                if let Some(window) = self.focused_window()
+                    && let Some(toplevel) = window.toplevel()
+                {
                     toplevel.send_close();
+                    self.closed_by_key = self.window_centre(&window).map(|c| (window.clone(), c));
                 }
             }
             Action::Quit => self.loop_signal.stop(),
@@ -202,7 +205,19 @@ impl Seven {
         }
     }
 
-    fn window_centre(&self, window: &Window) -> Option<Point<f64, Logical>> {
+    /// the window whose middle is closest to a canvas point
+    pub fn nearest_window(&self, from: Point<f64, Logical>) -> Option<Window> {
+        self.space
+            .elements()
+            .filter_map(|w| {
+                let c = self.window_centre(w)?;
+                Some((w, (c.x - from.x).powi(2) + (c.y - from.y).powi(2)))
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(w, _)| w.clone())
+    }
+
+    pub fn window_centre(&self, window: &Window) -> Option<Point<f64, Logical>> {
         let geo = self.space.element_geometry(window)?;
         Some(Point::from((
             geo.loc.x as f64 + geo.size.w as f64 / 2.0,

@@ -105,6 +105,10 @@ impl Seven {
         if let Some(ws) = self.workspaces.iter().find(|w| w.output == name) {
             return ws.number;
         }
+        // u removed every workspace last time so dont sneak one back in
+        if self.workspaces.is_empty() && self.no_workspaces_saved {
+            return 1;
+        }
         let size = self.screen_size();
         let number = self.free_number().unwrap_or(MAX_NUMBER + self.workspaces.len() as u32);
         let obstacles: Vec<Rect> = self.workspaces.iter().map(|w| w.rect).collect();
@@ -222,7 +226,7 @@ impl Seven {
         tracing::info!("workspace {number} made at {loc:?}");
     }
 
-    /// mod+shift+minus removes the workspace ur in and floats its tiles but the last one stays
+    /// mod+shift+minus removes the workspace ur in and floats its tiles even the last one
     pub fn destroy_workspace(&mut self) {
         let Some(i) = self.current_workspace() else {
             self.notify("Go into a workspace to remove it");
@@ -232,17 +236,17 @@ impl Seven {
     }
 
     pub fn remove_workspace(&mut self, i: usize) {
-        if self.workspaces.len() <= 1 {
-            self.notify("The last workspace can't be removed");
-            return;
-        }
         let ws = self.workspaces.remove(i);
         for (window, _) in &ws.tiled {
             if self.is_fullscreen(window) {
                 self.unfullscreen(window);
             }
+            // a maximized tile was only maximized inside the workspace
+            self.drop_maximized(window);
             self.place_beside(window, ws.rect);
         }
+        // they float now so they go above the tiles
+        self.restack();
         // monitors that called it home move to the nearest one left
         let nearest = |from: Point<f64, Logical>, all: &[Workspace]| {
             all.iter()

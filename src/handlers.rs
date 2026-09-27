@@ -131,8 +131,19 @@ impl XdgShellHandler for Seven {
             self.keep_closing_picture(&window);
             self.forget_window(&window);
         }
-        // give focus to the most recent window left
-        if had_focus {
+        // mod+q goes to the closest window left and anything else gives focus to the most recent one
+        let closed_by_key = self
+            .closed_by_key
+            .take_if(|(w, _)| w.toplevel().is_some_and(|t| t == &surface));
+        if let Some((_, from)) = closed_by_key {
+            match self.nearest_window(from) {
+                Some(next) => {
+                    self.focus(Some(&next));
+                    self.bring_into_view(&next);
+                }
+                None => self.focus(None),
+            }
+        } else if had_focus {
             let next = self.most_recent_window();
             self.focus(next.as_ref());
         }

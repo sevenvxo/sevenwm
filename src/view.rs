@@ -95,7 +95,8 @@ impl View {
         let lerp = |a: f64, b: f64| a + (b - a) * eased;
         let ((from_cam, from_zoom), (to_cam, to_zoom)) = (flight.from, flight.to);
         self.camera = Point::from((lerp(from_cam.x, to_cam.x), lerp(from_cam.y, to_cam.y)));
-        self.zoom = lerp(from_zoom, to_zoom);
+        // zoom blends on a log scale so a curve that overshoots cant push it to zero or below
+        self.zoom = from_zoom.max(1e-6) * (to_zoom.max(1e-6) / from_zoom.max(1e-6)).powf(eased);
         if t >= 1.0 {
             self.flight = None;
         }
@@ -154,5 +155,18 @@ mod tests {
         assert!(view.tick(Instant::now(), curve));
         assert_eq!((view.camera, view.zoom), (Point::from((500.0, 500.0)), 0.5));
         assert!(!view.tick(Instant::now(), curve), "the flight is over");
+    }
+
+    #[test]
+    fn overshooting_curves_keep_zoom_positive() {
+        let mut view = View::default();
+        view.set(Point::from((0.0, 0.0)), 1.0);
+        let start = Instant::now();
+        view.fly_to(Point::from((0.0, 0.0)), 0.1, std::time::Duration::from_millis(100));
+        for ms in 0..=120 {
+            let now = start + std::time::Duration::from_millis(ms);
+            view.tick(now, crate::animation::Curve::Spring);
+            assert!(view.zoom > 0.0, "zoom {} at {ms}ms", view.zoom);
+        }
     }
 }

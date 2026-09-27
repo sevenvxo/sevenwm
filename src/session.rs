@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use smithay::desktop::Window;
-use smithay::utils::{Point, Rectangle, Size};
+use smithay::utils::{IsAlive, Point, Rectangle, Size};
 
 use crate::state::Seven;
 use crate::workspaces::Workspace;
@@ -49,13 +49,12 @@ pub struct SavedWindow {
 pub struct Pending {
     pub windows: Vec<SavedWindow>,
     pub until: Instant,
+    /// tiles already put back w their remembered spot so later ones slot in around them
+    pub placed: Vec<(Window, usize)>,
 }
 
 /// how long every window has to stay closed before the session forgets them
 const ALL_CLOSED_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
-
-/// a restored tiles spot among its workspace tiles maybe
-struct TileIndex(usize);
 
 /// SEVENWM_SESSION_FILE overrides the file and makes nested runs use it too for testing
 fn path() -> Option<PathBuf> {
@@ -89,6 +88,7 @@ impl Seven {
         else {
             return;
         };
+        self.no_workspaces_saved = session.workspaces.is_empty();
         for ws in &session.workspaces {
             if self.ws_index(ws.number).is_none() {
                 self.workspaces
@@ -97,6 +97,7 @@ impl Seven {
         }
         let secs = self.config.session.restore_within_seconds;
         self.pending = Some(Pending {
+            placed: Vec::new(),
             windows: session.windows,
             until: Instant::now() + std::time::Duration::from_secs(secs),
         });
@@ -147,22 +148,29 @@ impl Seven {
             return false;
         };
         let saved = pending.windows.remove(i);
+        let mut placed = std::mem::take(&mut pending.placed);
         tracing::info!("session: {app_id} goes back where it was");
         let rect = rect_of(saved.rect);
         match saved.workspace.and_then(|n| self.ws_index(n)) {
             Some(ws) => {
-                window.user_data().insert_if_missing(|| TileIndex(saved.index));
                 self.space.map_element(window.clone(), rect.loc, false);
-                self.tile_into(window, ws);
-                // keep the remembered order and splits
+                self.drop_maximized(window);
+                // it goes before the first restored tile that came after it and tiles u opened meanwhile stay put
+                placed.retain(|(w, _)| w.alive());
                 let tiled = &mut self.workspaces[ws].tiled;
-                if let Some((_, ratio)) = tiled.iter_mut().find(|(w, _)| w == window) {
-                    *ratio = saved.ratio;
-                }
-                tiled.sort_by_key(|(w, _)| w.user_data().get::<TileIndex>().map_or(0, |t| t.0));
+                let at = tiled
+                    .iter()
+                    .position(|(w, _)| placed.iter().any(|(p, k)| p == w && *k > saved.index))
+                    .unwrap_or(tiled.len());
+                tiled.insert(at, (window.clone(), saved.ratio));
+                placed.push((window.clone(), saved.index));
                 self.retile();
+                self.restack();
             }
             None => self.resize_window(window, rect),
+        }
+        if let Some(pending) = &mut self.pending {
+            pending.placed = placed;
         }
         if let Some([x, y]) = saved.marker {
             self.collapse(window);

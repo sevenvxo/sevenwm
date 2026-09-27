@@ -445,8 +445,8 @@ impl Seven {
             Item::ReturnToRegion => !tiled,
             Item::Float | Item::WorkspaceMenu => tiled,
             Item::Heading => false,
-            Item::RemoveWorkspace => self.workspaces.len() > 1,
-            Item::Close
+            Item::RemoveWorkspace
+            | Item::Close
             | Item::HideFromScreencast
             | Item::Collapse
             | Item::Numbers(_)

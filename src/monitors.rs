@@ -208,6 +208,15 @@ impl Seven {
         }
         // make it active so its data is in the fields then hand off
         self.activate(output);
+        // remember where it was looking so a quick unplug and replug lands u in the same spot
+        let (camera, zoom) = self.view.destination();
+        self.saved_monitors.retain(|m| m.name != output.name());
+        self.saved_monitors.push(crate::session::SavedMonitor {
+            name: output.name(),
+            camera: [camera.x, camera.y],
+            zoom,
+            home: self.home,
+        });
         self.space.unmap_output(output);
         let Some(next) = (!self.monitors.is_empty()).then(|| self.monitors.remove(0)) else {
             // the last monitor so keep everything for when one comes back
