@@ -1,43 +1,24 @@
-sevenwm
+# sevenwm
 
 A dynamic Wayland compositor and window manager written in Rust.
 
-Note: sevenwm is currently in early development.
+> **Note:** sevenwm is currently in early development.
 
-Features
+## Features
 
-Tiling and floating windows
+- Tiling and floating windows
+- Zoomable desktop canvas
+- Workspaces
+- Animations and decorations
+- Configurable keybindings
+- XWayland support
+- Session restoration
+- IPC support
+- Built with Rust and Smithay
 
-Zoomable desktop canvas
+## Installation
 
-Workspaces
-
-Animations and decorations
-
-Configurable keybindings
-
-XWayland support
-
-Session restoration
-
-IPC support
-
-Built with Rust and Smithay
-
-Installation
+```bash
 git clone https://github.com/sevenvxo/sevenwm
 cd sevenwm
 cargo build --release
-
-
-See config.default.toml for configuration options.
-
-Related
-
-sevenshell — the desktop shell built for sevenwm.
-
-https://github.com/sevenvxo/sevenshell
-
-License
-
-BSD 3-Clause
