@@ -1,6 +1,7 @@
 # sevenwm
 
 A dynamic Wayland compositor and window manager written in Rust.
+Desktop environment for sevenwm: [sevenshell](https://github.com/sevenvxo/sevenshell)
 
 > **Note:** sevenwm is currently in early development.
 
