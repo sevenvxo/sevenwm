@@ -79,6 +79,8 @@ impl CompositorHandler for Seven {
                         let display = state.display_handle.clone();
                         data.compositor_state.blocker_cleared(state, &display);
                     }
+                    // the held commit just landed so redraw or the client waits on its frame callback
+                    state.damage();
                     Ok(())
                 })
                 .is_ok();
@@ -102,6 +104,25 @@ impl CompositorHandler for Seven {
                 self.update_window_list(&window);
                 self.settle_new_window(&window);
                 tracing::trace!(geometry = ?window.geometry(), "window commit");
+                let size = window.geometry().size;
+                let seen = window.user_data().get_or_insert(|| std::cell::Cell::new(size));
+                let before = seen.replace(size);
+                if before != size {
+                    tracing::debug!(?size, "window picked a new size");
+                }
+                // xwayland-satellite takes its title bar off again on every sizeless configure so x11 windows shrank on each focus change
+                if self.is_satellite(&window)
+                    && size.w > 0
+                    && size.h > 0
+                    && let Some(toplevel) = window.toplevel()
+                    && toplevel.is_initial_configure_sent()
+                {
+                    toplevel.with_pending_state(|state| {
+                        if state.size.is_none() || state.size == Some(before) {
+                            state.size = Some(size);
+                        }
+                    });
+                }
             }
         }
 
@@ -238,12 +259,14 @@ impl XdgShellHandler for Seven {
 
     /// the apps uhh maximize button or a double click on its header bar
     fn maximize_request(&mut self, surface: ToplevelSurface) {
+        tracing::debug!("maximize request");
         if let Some(window) = self.window_for_surface(surface.wl_surface()) {
             self.maximize(&window);
         }
     }
 
     fn unmaximize_request(&mut self, surface: ToplevelSurface) {
+        tracing::debug!("unmaximize request");
         if let Some(window) = self.window_for_surface(surface.wl_surface()) {
             self.unmaximize(&window);
         }
@@ -555,6 +578,35 @@ impl PointerConstraintsHandler for Seven {
                 },
             );
         }
+    }
+
+    /// xwayland fakes cursor warps (wine mouselook like studio's camera) w a lock + hints so follow them or the pointer jumps around
+    fn cursor_position_hint(
+        &mut self,
+        surface: &WlSurface,
+        pointer: &PointerHandle<Self>,
+        location: Point<f64, Logical>,
+    ) {
+        let active = smithay::wayland::pointer_constraints::with_pointer_constraint(
+            surface,
+            pointer,
+            |constraint| constraint.is_some_and(|c| c.is_active()),
+        );
+        if !active {
+            return;
+        }
+        let Some((under, origin)) = self.surface_under(self.pointer_screen) else {
+            return;
+        };
+        if &under != surface {
+            return;
+        }
+        let canvas = origin + location;
+        let global = self.view.to_screen(canvas) + self.active_pos.to_f64();
+        self.set_pointer_global(global);
+        // locked so just move it quietly, no motion to the app
+        pointer.set_location(self.view.to_canvas(self.pointer_screen));
+        self.damage();
     }
 }
 

@@ -170,17 +170,7 @@ pub fn compose(
 
     // a fullscreen window u look at covers panels but not overlays
     let view = &state.view;
-    let fullscreen = state
-        .fullscreen
-        .last()
-        .map(|(window, _)| window.clone())
-        .filter(|window| {
-            view.zoom == 1.0
-                && state
-                    .space
-                    .element_location(window)
-                    .is_some_and(|loc| view.camera == loc.to_f64())
-        });
+    let fullscreen = state.covering_fullscreen();
     push_layers(
         &mut elements,
         renderer,

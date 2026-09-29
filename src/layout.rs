@@ -236,6 +236,20 @@ pub fn free_spot(
         .min_by(|a, b| distance(a).total_cmp(&distance(b)))
 }
 
+/// whether other sits snapped against rects side w the gap between them give or take a pixel or two
+pub fn beside(rect: Rect, other: Rect, side: Direction, gap: i32) -> bool {
+    let (a, o) = (rect, other);
+    let overlap_x = a.loc.x < o.loc.x + o.size.w && o.loc.x < a.loc.x + a.size.w;
+    let overlap_y = a.loc.y < o.loc.y + o.size.h && o.loc.y < a.loc.y + a.size.h;
+    let near = |x: i32, y: i32| (x - y).abs() <= 2;
+    match side {
+        Direction::Left => overlap_y && near(o.loc.x + o.size.w + gap, a.loc.x),
+        Direction::Right => overlap_y && near(a.loc.x + a.size.w + gap, o.loc.x),
+        Direction::Up => overlap_x && near(o.loc.y + o.size.h + gap, a.loc.y),
+        Direction::Down => overlap_x && near(a.loc.y + a.size.h + gap, o.loc.y),
+    }
+}
+
 /// move rect the least it needs to fit inside bounds
 pub fn clamp_into(rect: Rect, bounds: Rect) -> Point<i32, Logical> {
     let clamp = |pos: i32, len: i32, lo: i32, span: i32| {
@@ -282,6 +296,16 @@ pub fn nearest(origin: Point<f64, Logical>, dir: Direction, rects: &[Rect]) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn beside_needs_the_gap_and_some_overlap() {
+        let a = Rect::new(Point::from((100, 0)), Size::from((100, 100)));
+        let left = Rect::new(Point::from((0, 50)), Size::from((90, 100)));
+        assert!(beside(a, left, Direction::Left, 10));
+        assert!(!beside(a, left, Direction::Right, 10));
+        let far_down = Rect::new(Point::from((0, 200)), Size::from((90, 100)));
+        assert!(!beside(a, far_down, Direction::Left, 10));
+    }
 
     #[test]
     fn a_ratio_for_a_size_gives_that_size() {

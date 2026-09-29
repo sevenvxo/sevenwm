@@ -150,12 +150,29 @@ impl Seven {
     ) -> Option<(LayerSurface, WlSurface, Point<f64, Logical>)> {
         let output = self.output.as_ref()?;
         let map = layer_map_for_output(output);
-        layers.iter().find_map(|&layer| {
+        // a fullscreen window covers every panel but overlays so clicks cant reach the bar under it
+        let covered = self.covering_fullscreen().is_some();
+        layers.iter().filter(|l| !covered || **l == Layer::Overlay).find_map(|&layer| {
             let hit = map.layer_under(layer, screen)?;
             let layer_loc = map.layer_geometry(hit)?.loc;
             hit.surface_under(screen - layer_loc.to_f64(), WindowSurfaceType::ALL)
                 .map(|(surface, offset)| (hit.clone(), surface, (offset + layer_loc).to_f64()))
         })
+    }
+
+    /// the fullscreen window filling the active screen right now if theres one
+    pub fn covering_fullscreen(&self) -> Option<smithay::desktop::Window> {
+        let view = &self.view;
+        self.fullscreen
+            .last()
+            .map(|(window, _)| window.clone())
+            .filter(|window| {
+                view.zoom == 1.0
+                    && self
+                        .space
+                        .element_location(window)
+                        .is_some_and(|loc| view.camera == loc.to_f64())
+            })
     }
 
     /// does the layout thing for every outputs layers again

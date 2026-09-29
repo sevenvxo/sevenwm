@@ -110,7 +110,7 @@ pub struct Seven {
     pub children: std::cell::RefCell<Vec<Spawned>>,
     /// keep_running programs w their command process and last restart
     pub kept: Vec<(String, Spawned)>,
-    pub kept_restarts: Vec<Instant>,
+    pub kept_restarts: Vec<(String, Instant)>,
     /// the keep_running list as last applied or none when this run doesnt keep things running
     pub kept_config: Option<Vec<String>>,
     /// the ipc socket and clients following state changes
@@ -125,7 +125,7 @@ pub struct Seven {
     /// the window mod+q asked to close and where its middle was so focus goes to the nearest one after
     pub closed_by_key: Option<(Window, Point<f64, Logical>)>,
     /// exec-outside launches still waiting for their window
-    pub open_outside: Vec<Instant>,
+    pub open_outside: Vec<(Instant, String)>,
     /// stable ids for the drawn outlines so redraws reuse them
     pub decoration_ids: [Id; 9],
     /// new windows waiting for their first commit to get placed
@@ -584,8 +584,15 @@ impl Seven {
 
     /// run command thru the shell hooked up to this compositor
     pub fn spawn(&self, command: &str) {
+        self.spawn_with(command, &[]);
+    }
+
+    /// spawn w extra env vars like the exec-outside tag
+    pub fn spawn_with(&self, command: &str, env: &[(&str, &str)]) {
         tracing::info!("spawning {command}");
-        match self.command(command).spawn() {
+        let mut child = self.command(command);
+        child.envs(env.iter().copied());
+        match child.spawn() {
             Ok(child) => self.children.borrow_mut().push(Spawned::new(command, child)),
             Err(err) => tracing::warn!("failed to spawn {command}: {err}"),
         }
@@ -656,14 +663,15 @@ impl Seven {
         let now = Instant::now();
         for (command, status) in crashed {
             self.kept_restarts
-                .retain(|at| now.duration_since(*at) < std::time::Duration::from_secs(60));
-            if self.kept_restarts.len() >= 5 {
+                .retain(|(_, at)| now.duration_since(*at) < std::time::Duration::from_secs(60));
+            // each program gets its own five so one crashy program cant use up the shells
+            if self.kept_restarts.iter().filter(|(c, _)| *c == command).count() >= 5 {
                 tracing::warn!("{command} exited ({status}) again; not restarting it");
                 self.notify(&format!("{command} keeps crashing; not restarting it"));
                 continue;
             }
             tracing::warn!("{command} exited ({status}); restarting it");
-            self.kept_restarts.push(now);
+            self.kept_restarts.push((command.clone(), now));
             self.spawn_kept(&command);
         }
     }

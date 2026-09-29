@@ -90,10 +90,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     state.apply_keyboard_settings();
     state.load_session();
 
+    // nested connects to the host thru WAYLAND_DISPLAY so that goes before we point it at ourselves
     if nested {
         winit::init(&mut event_loop, &mut state)?;
-    } else {
-        udev::init(&mut event_loop, &mut state)?;
     }
 
     // kids have to connect to us not the host
@@ -165,6 +164,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
 
+    // the gpu and monitor come up last so the shell starting up overlaps the modeset and login is faster
+    // apps only talk to us once the loop runs so every global is there by then
+    if !nested {
+        udev::init(&mut event_loop, &mut state)?;
+    }
+
     event_loop.run(None, &mut state, |_| {})?;
     state.save_session();
     state.stop_xwayland();
@@ -178,5 +183,9 @@ fn init_logging() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         // our own messages but only smithays warnings bc its info dumps every gl extension
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("sevenwm=info,warn"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    // stderr so the session script catches it in sevenwm.log
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
 }

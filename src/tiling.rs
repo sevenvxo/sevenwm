@@ -78,6 +78,44 @@ impl Seven {
         )
     }
 
+    /// the part of the active screen the panels leave free in screen coords
+    pub fn usable_screen(&self) -> Rectangle<f64, Logical> {
+        let screen = self.screen_size();
+        self.output
+            .as_ref()
+            .map_or(Rectangle::from_size(screen), |o| {
+                layer_map_for_output(o).non_exclusive_zone()
+            })
+            .to_f64()
+    }
+
+    /// the canvas u can see around the panels from a camera at a zoom
+    pub fn usable_view(&self, camera: Point<f64, Logical>, zoom: f64) -> Rectangle<f64, Logical> {
+        let zone = self.usable_screen();
+        Rectangle::new(
+            Point::from((camera.x + zone.loc.x / zoom, camera.y + zone.loc.y / zoom)),
+            Size::from((zone.size.w / zoom, zone.size.h / zoom)),
+        )
+    }
+
+    /// the camera that puts rect in the middle under the bar or its top left in view if its too big
+    pub fn camera_for(&self, rect: Rect, zoom: f64) -> Point<f64, Logical> {
+        let zone = self.usable_screen();
+        let axis = |pos: i32, len: i32, zone_pos: f64, zone_len: f64| {
+            let span = zone_len / zoom;
+            let start = if len as f64 > span {
+                pos as f64
+            } else {
+                pos as f64 + (len as f64 - span) / 2.0
+            };
+            start - zone_pos / zoom
+        };
+        Point::from((
+            axis(rect.loc.x, rect.size.w, zone.loc.x, zone.size.w),
+            axis(rect.loc.y, rect.size.h, zone.loc.y, zone.size.h),
+        ))
+    }
+
     /// every workspace area
     pub fn ws_areas(&self) -> Vec<Rect> {
         (0..self.workspaces.len()).map(|i| self.ws_area(i)).collect()
@@ -298,7 +336,7 @@ impl Seven {
 
     /// put a new window where it goes tiled if ur looking at a workspace or floating where ur looking
     pub fn place_new_window(&mut self, window: Window) {
-        let visible = self.view.visible(self.screen_size());
+        let visible = self.usable_view(self.view.camera, self.view.zoom);
         let view_centre = Point::from((
             visible.loc.x + visible.size.w / 2.0,
             visible.loc.y + visible.size.h / 2.0,
@@ -335,10 +373,15 @@ impl Seven {
         let dialog = parent.is_some() || fixed.is_some();
         // the window an exec-outside launch was waiting for so float it beside the workspace
         let now = Instant::now();
-        self.open_outside.retain(|deadline| *deadline > now);
-        let outside = !dialog && !self.open_outside.is_empty();
-        if outside {
-            self.open_outside.remove(0);
+        self.open_outside.retain(|(deadline, _)| *deadline > now);
+        let tag = (!dialog && !self.open_outside.is_empty())
+            .then(|| self.window_pid(&window))
+            .flatten()
+            .and_then(outside_tag);
+        let waiting = tag.and_then(|tag| self.open_outside.iter().position(|(_, t)| *t == tag));
+        let outside = waiting.is_some();
+        if let Some(i) = waiting {
+            self.open_outside.remove(i);
         }
         let viewed = viewed.filter(|_| !outside);
         let tile = match (rule.float, self.config.placement.new_windows) {
@@ -407,7 +450,7 @@ impl Seven {
         if !settle.viewed {
             obstacles.extend(self.ws_areas());
         }
-        let visible = self.view.visible(self.screen_size());
+        let visible = self.usable_view(self.view.camera, self.view.zoom);
         let gap = self.config.snap.gap;
         let in_view = layout::inset(visible.to_i32_round(), gap);
         let in_view = match self.bounds() {
@@ -474,18 +517,11 @@ impl Seven {
             return;
         }
         let (camera, zoom) = self.view.destination();
-        let screen = self.screen_size();
-        let visible = Rectangle::new(
-            camera,
-            Size::from((screen.w as f64 / zoom, screen.h as f64 / zoom)),
-        );
-        if visible.contains_rect(rect.to_f64()) {
+        // the bar covers part of the screen so only count whats under it
+        if self.usable_view(camera, zoom).contains_rect(rect.to_f64()) {
             return;
         }
-        let camera = Point::from((
-            rect.loc.x as f64 + rect.size.w as f64 / 2.0 - visible.size.w / 2.0,
-            rect.loc.y as f64 + rect.size.h as f64 / 2.0 - visible.size.h / 2.0,
-        ));
+        let camera = self.camera_for(rect, zoom);
         let duration = Duration::from_millis(self.config.view.fly_duration_ms);
         self.view.fly_to(camera, zoom, duration);
     }
@@ -504,12 +540,7 @@ impl Seven {
             self.fly(rect.loc.to_f64(), 1.0);
             return;
         }
-        let screen = self.screen_size();
-        let camera = Point::from((
-            rect.loc.x as f64 + (rect.size.w - screen.w) as f64 / 2.0,
-            rect.loc.y as f64 + (rect.size.h - screen.h) as f64 / 2.0,
-        ));
-        self.fly(camera, 1.0);
+        self.fly(self.camera_for(rect, 1.0), 1.0);
     }
 }
 
@@ -554,12 +585,7 @@ impl Seven {
         let Some(rect) = self.frame(window) else {
             return;
         };
-        let screen = self.screen_size();
-        let camera = Point::from((
-            rect.loc.x as f64 + rect.size.w as f64 / 2.0 - screen.w as f64 / 2.0,
-            rect.loc.y as f64 + rect.size.h as f64 / 2.0 - screen.h as f64 / 2.0,
-        ));
-        self.fly(camera, 1.0);
+        self.fly(self.camera_for(rect, 1.0), 1.0);
     }
 
     /// mod+plus and mod+minus zoom around the middle of the screen and held keys keep zooming smooth
@@ -580,4 +606,14 @@ impl Seven {
         let duration = Duration::from_millis(self.config.view.fly_duration_ms);
         self.view.fly_to(camera, zoom, duration);
     }
+}
+
+/// the exec-outside tag in a process env if it was started by one
+fn outside_tag(pid: i32) -> Option<String> {
+    let environ = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    let prefix = format!("{}=", crate::actions::OUTSIDE_ENV);
+    environ
+        .split(|b| *b == 0)
+        .find_map(|var| var.strip_prefix(prefix.as_bytes()))
+        .map(|tag| String::from_utf8_lossy(tag).into_owned())
 }
