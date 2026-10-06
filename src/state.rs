@@ -60,7 +60,7 @@ pub struct Seven {
     pub closing: Vec<crate::closing::Closing>,
     pub gles_context: Option<smithay::backend::renderer::ContextId<smithay::backend::renderer::gles::GlesTexture>>,
     /// this frames title bar images
-    pub titlebars: Vec<(Window, smithay::backend::renderer::element::memory::MemoryRenderBuffer)>,
+    pub titlebars: std::collections::HashMap<Window, smithay::backend::renderer::element::memory::MemoryRenderBuffer>,
     /// every workspace on the canvas
     pub workspaces: Vec<crate::workspaces::Workspace>,
     /// the active monitors home workspace number
@@ -118,10 +118,17 @@ pub struct Seven {
     pub subscribers: Vec<crate::ipc::Subscriber>,
     /// the state last sent to subscribers
     pub ipc_last: Option<serde_json::Value>,
+    /// what that state was built from and when so unchanged or too quick frames skip it
+    pub ipc_stamp: Option<crate::ipc::IpcStamp>,
+    pub ipc_built: Option<Instant>,
+    /// a timer is coming to send what a too quick frame held back
+    pub ipc_timer: bool,
     /// the ui font loaded the first time its needed
     pub font: Option<crate::text::Font>,
-    /// in the overview the camera and zoom to go back to
-    pub overview: Option<(Point<f64, Logical>, f64)>,
+    /// in the overview the view and window to go back to
+    pub overview: Option<crate::tiling::Overview>,
+    /// colors a shell pushed over ipc that stay on top of the config thru reloads
+    pub color_override: Option<serde_json::Map<String, serde_json::Value>>,
     /// the window mod+q asked to close and where its middle was so focus goes to the nearest one after
     pub closed_by_key: Option<(Window, Point<f64, Logical>)>,
     /// exec-outside launches still waiting for their window
@@ -134,6 +141,8 @@ pub struct Seven {
     pub history: Vec<Window>,
     /// spot in history while alt-tab is held
     pub cycle: Option<usize>,
+    /// a window that just got focus and the mouse still has to move to w tries left
+    pub warp_pending: Option<(Window, u8)>,
     /// fullscreen windows and the rect each goes back to
     pub fullscreen: Vec<(Window, Rectangle<i32, Logical>)>,
 
@@ -197,6 +206,14 @@ pub struct Seven {
     pub xwayland_restarts: Vec<Instant>,
     /// applies monitor modes after a reload on real hardware
     pub mode_hook: Option<ModeHook>,
+    /// udev sets the monitors gamma thru this for night light
+    pub gamma_hook: Option<crate::display::GammaHook>,
+    /// the night light temperature last put on the monitors or none before the first try
+    pub night_applied: Option<Option<u32>>,
+    /// the shell asked to keep the screen awake like caffeine
+    pub caffeine: bool,
+    /// when something last copied the screen so the bar can show a screen share dot
+    pub last_capture: Option<Instant>,
     /// the seat session on real hardware for vt switching
     pub session: Option<smithay::backend::session::libseat::LibSeatSession>,
     pub dmabuf_state: smithay::wayland::dmabuf::DmabufState,
@@ -275,7 +292,7 @@ impl Seven {
             workspaces: Vec::new(),
             collapsed: Vec::new(),
             shaders: None,
-            titlebars: Vec::new(),
+            titlebars: Default::default(),
             closing: Vec::new(),
             gles_context: None,
             pending: None,
@@ -293,6 +310,7 @@ impl Seven {
             drop_target: None,
             dragging: None,
             overview: None,
+            color_override: None,
             closed_by_key: None,
             open_outside: Vec::new(),
             menu: None,
@@ -302,6 +320,9 @@ impl Seven {
             ipc_path: None,
             subscribers: Vec::new(),
             ipc_last: None,
+            ipc_stamp: None,
+            ipc_built: None,
+            ipc_timer: false,
             wallpaper: crate::wallpaper::Wallpaper::default(),
             children: Default::default(),
             kept: Vec::new(),
@@ -325,6 +346,7 @@ impl Seven {
             unplaced: Vec::new(),
             history: Vec::new(),
             cycle: None,
+            warp_pending: None,
             fullscreen: Vec::new(),
             config,
             config_error,
@@ -350,6 +372,10 @@ impl Seven {
             draw_cursor: !nested,
             session: None,
             mode_hook: None,
+            gamma_hook: None,
+            night_applied: None,
+            caffeine: false,
+            last_capture: None,
             activation_state: smithay::wayland::xdg_activation::XdgActivationState::new::<Self>(
                 &dh,
             ),
@@ -416,11 +442,25 @@ impl Seven {
 
     /// focus and raise without touching the recent order for alt-tab steps
     pub fn focus_without_history(&mut self, window: Option<&Window>) {
-        let serial = SERIAL_COUNTER.next_serial();
         if let Some(window) = window {
+            self.uncover_tile(window);
             self.space.raise_element(window, true);
             self.restack();
+            self.queue_warp(window);
         }
+        self.set_keyboard_focus(window);
+    }
+
+    /// the mouse moved onto a window so focus it but leave the stacking alone
+    pub fn focus_hovered(&mut self, window: &Window) {
+        crate::collapse::touch(window);
+        self.history.retain(|w| w != window);
+        self.history.insert(0, window.clone());
+        self.set_keyboard_focus(Some(window));
+    }
+
+    fn set_keyboard_focus(&mut self, window: Option<&Window>) {
+        let serial = SERIAL_COUNTER.next_serial();
         for w in self.space.elements() {
             w.set_activated(Some(w) == window);
             if let Some(toplevel) = w.toplevel() {
@@ -456,9 +496,15 @@ impl Seven {
                 _ => {}
             }
         }
+        // closing the fullscreen window ur looking at puts the view back like leaving fullscreen does
+        if self.is_fullscreen(window) {
+            self.view_back_from_fullscreen(window);
+        }
         self.fullscreen.retain(|(w, _)| w != window);
         self.collapsed.retain(|c| c.window != *window);
         self.space.unmap_elem(window);
+        // whoever it pushed aside when it maximized or went fullscreen comes back
+        self.pull_back_pushed(window);
         self.untile(window);
     }
 

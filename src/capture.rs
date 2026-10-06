@@ -10,7 +10,7 @@ use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::{Bind, ExportMem, Offscreen};
 use smithay::output::{Output, WeakOutput};
 use smithay::reexports::wayland_server::protocol::wl_shm;
-use smithay::utils::{Physical, Point, Rectangle, Scale, Size, Transform};
+use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 use smithay::wayland::image_capture_source::{
     ImageCaptureSource, ImageCaptureSourceHandler, OutputCaptureSourceHandler,
     OutputCaptureSourceState,
@@ -106,14 +106,24 @@ impl Seven {
         }
         let window = self.window_for_source(source)?;
         let size = window.geometry().size;
-        (size.w > 0 && size.h > 0).then(|| Size::from((size.w, size.h)))
+        let scale = self.window_capture_scale();
+        (size.w > 0 && size.h > 0).then(|| {
+            Size::from(((size.w as f64 * scale).ceil() as i32, (size.h as f64 * scale).ceil() as i32))
+        })
+    }
+
+    /// a window capture is drawn at the sharpest monitor scale so it isnt blurry on a hidpi screen
+    fn window_capture_scale(&self) -> f64 {
+        self.outputs()
+            .map(|o| o.current_scale().fractional_scale())
+            .fold(1.0, f64::max)
     }
 
     /// mod+shift+s does the screenshot thing where it freezes the screen and runs the command
     pub fn screenshot(&mut self) {
         if self.config.screenshot.freeze {
             self.freeze = Some(Freeze {
-                waiting: self.outputs().iter().map(|o| o.name()).collect(),
+                waiting: self.outputs().map(|o| o.name()).collect(),
                 stills: Vec::new(),
                 since: Instant::now(),
                 until: None,
@@ -199,6 +209,7 @@ pub fn serve_captures(state: &mut Seven, renderer: &mut GlesRenderer, output: &O
         return;
     }
     let scale = output.current_scale().fractional_scale();
+    let window_scale = state.window_capture_scale();
     let now = state.start_time.elapsed();
     let mut captured = false;
     let mut later = Vec::new();
@@ -208,7 +219,7 @@ pub fn serve_captures(state: &mut Seven, renderer: &mut GlesRenderer, output: &O
         if let Some(wanted) = source.user_data().get::<WeakOutput>() {
             match wanted.upgrade() {
                 Some(wanted) if wanted == *output => {}
-                Some(wanted) if state.outputs().contains(&wanted) => {
+                Some(wanted) if state.outputs().any(|o| *o == wanted) => {
                     later.push((frame, session));
                     continue;
                 }
@@ -233,7 +244,7 @@ pub fn serve_captures(state: &mut Seven, renderer: &mut GlesRenderer, output: &O
         }
         // a window alone sits on black and the screen on the canvas color
         let (elements, background) = match state.window_for_source(&source) {
-            Some(window) => (window_alone(state, renderer, &window), [0.0, 0.0, 0.0, 1.0]),
+            Some(window) => (window_alone(state, renderer, &window, window_scale), [0.0, 0.0, 0.0, 1.0]),
             None => (
                 crate::render::compose(
                     state,
@@ -246,6 +257,7 @@ pub fn serve_captures(state: &mut Seven, renderer: &mut GlesRenderer, output: &O
                 state.config.canvas.background,
             ),
         };
+        let scale = if state.window_for_source(&source).is_some() { window_scale } else { scale };
         match copy_to_buffer(
             renderer,
             size,
@@ -258,6 +270,7 @@ pub fn serve_captures(state: &mut Seven, renderer: &mut GlesRenderer, output: &O
                 tracing::debug!("capture served");
                 frame.success(Transform::Normal, None, now);
                 captured = true;
+                state.last_capture = Some(std::time::Instant::now());
             }
             Err(err) => {
                 tracing::warn!("capture failed: {err}");
@@ -277,13 +290,15 @@ fn window_alone(
     state: &Seven,
     renderer: &mut GlesRenderer,
     window: &smithay::desktop::Window,
+    scale: f64,
 ) -> Vec<FrameElement> {
     // hidden collapsed or locked so black frame
     if crate::menu::hidden_from_capture(window) || state.is_locked() || state.is_collapsed(window) {
         return Vec::new();
     }
-    let origin = Point::<i32, Physical>::from((-window.geometry().loc.x, -window.geometry().loc.y));
-    window.render_elements::<FrameElement>(renderer, origin, Scale::from(1.0), 1.0)
+    let loc = window.geometry().loc;
+    let origin = Point::<f64, Logical>::from((-loc.x as f64, -loc.y as f64)).to_physical(scale).to_i32_round();
+    window.render_elements::<FrameElement>(renderer, origin, Scale::from(scale), 1.0)
 }
 
 fn copy_to_buffer(

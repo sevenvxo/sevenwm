@@ -32,10 +32,10 @@ new_tile_position = "main"     # where a window entering a workspace goes main o
 
 # workspaces are numbered tiled areas on the canvas each the size of its monitor
 # mod+number goes to one and mod+shift+plus or minus makes or removes one
-# mod+ctrl+drag moves one and mod+ctrl+right click on its empty space changes its number
+# mod+alt+drag moves one and mod+alt+right click on its empty space changes its number
 [workspaces]
 gap = 80                       # space kept between workspaces
-drag_modifier = "ctrl"         # hold this w mod to drag a workspace
+drag_modifier = "alt"          # hold this w mod to drag a workspace
 
 [placement]
 # where new windows go
@@ -44,6 +44,9 @@ drag_modifier = "ctrl"         # hold this w mod to drag a workspace
 # always-float
 new_windows = "by-view"
 float_size = [960, 640]        # size new floating windows open at
+# apps that tile or snap in next to other windows like before and every other app floats in the middle of the view
+tile_apps = ["kitty", "foot", "Alacritty", "alacritty", "org.wezfurlong.wezterm", "com.mitchellh.ghostty", "*terminal*", "*Terminal*", "xterm*", "konsole*"]
+maximize_tolerance = 100       # a new floating window within this many px of the screen size opens maximized and 0 turns it off
 
 [snap]
 enabled = true
@@ -56,10 +59,13 @@ zoom_max = 2.0
 zoom_step = 1.1                # per scroll notch
 fly_duration_ms = 250          # how long the view takes to fly somewhere and 0 js jumps
 focus_follows_view = true      # focusing a window off screen flies the view to it
+focus_follows_mouse = true     # the window under the mouse gets focus w/o raising it
+mouse_follows_focus = true     # focusing a tile by key or anything else puts the mouse in its middle
+focus_leaves_workspace = true  # mod+arrow from a tile can go on to windows outside its workspace
 drag_empty_canvas_pans = true  # a plain drag on empty canvas pans
-pan_modifier = "alt"           # hold this w mod to pan even over windows
+pan_modifier = "ctrl"          # hold this w mod to pan even over windows
 
-# "combo" = "action". Modifiers: mod, super, alt, ctrl, shift.
+# each line is combo = action and the modifiers are mod super alt ctrl and shift
 # keys use xkb names like a-z 0-9 left right up down tab space return f1
 # set an action to none to unbind a default
 # actions
@@ -69,9 +75,12 @@ pan_modifier = "alt"           # hold this w mod to pan even over windows
 # quit exit sevenwm
 # cycle-windows cycle focus most recent first
 # home fly back to the workspace u were last in
-# overview zoom out to see every window
+# overview zoom out to see every window and again to go back to the window u were on
 # zoom-in zoom-out zoom around the middle of the screen
 # center-window fly to the focused window at 100% zoom
+# origin fly back to where the canvas starts at 0 0
+# window-to-origin float the focused window at 0 0 and go there
+# workspace-to-origin move the workspace ur on to 0 0 and whatever was there trades places w it
 # toggle-fullscreen
 # toggle-maximize fill the screen but keep the bar
 # toggle-floating float a tile or tile a floating window
@@ -83,8 +92,8 @@ pan_modifier = "alt"           # hold this w mod to pan even over windows
 # collapse fold the window into a marker or bring one back
 # focus dir focus the nearest window that way
 # move dir move the focused window
-# grow dir push that edge of the window out
-# shrink dir pull that edge of the window in
+# grow dir push that edge of the window out and on a tile move its border that way like hyprland
+# shrink dir pull the far edge in toward dir so shrink left brings the right side left
 # relaunch-window kill the app and start it again
 # reload-config
 # screenshot freeze the screen and pick an area
@@ -92,10 +101,11 @@ pan_modifier = "alt"           # hold this w mod to pan even over windows
 # mod + left drag move a window and drop it on a workspace to tile it
 # mod + right drag resize a floating window from its nearest corner
 # mod + right click window menu and hover workspace for its menu
-# mod + ctrl + right click workspace menu on its empty space
-# mod + ctrl + left drag move a workspace and its tiles
-# mod + alt + left drag pan the view even over windows
+# mod + alt + right click workspace menu on its empty space
+# mod + alt + left drag move a workspace and its tiles
+# mod + ctrl + left drag pan the view even over windows
 # left drag on empty canvas pan the view
+# in the overview a left drag moves a window and a click goes to it
 # mod + scroll zoom around the cursor
 
 [output]
@@ -138,6 +148,18 @@ suspend_after = 600
 # what locks the screen when idle and again if the lock screen crashes so u never get stuck locked
 lock_command = "sevenshell lock"
 suspend_command = "systemctl suspend"
+
+# warmer colors at night thru the monitors gamma and it only works on real hardware not nested
+[night_light]
+enabled = false
+temperature = 4000             # kelvin where 6500 is normal and lower is warmer
+from = ""                      # hh:mm like 20:00 and w until empty on both means the whole time its on
+until = ""                     # hh:mm like 07:00
+
+# dims the brightest parts of windows so a white page at night doesnt blind u
+[anti_flashbang]
+enabled = false
+max_brightness = 0.75          # 0.05 to 1 how bright a window pixel can get
 
 [border]
 width = 2                      # 0 for none and it scales w zoom
@@ -194,10 +216,13 @@ close_style = "zoom"           # closed windows going away
 close_ms = 150
 close_curve = "ease-out-quad"
 fly_curve = "ease-out-cubic"   # the view flying and its length is view.fly_duration_ms
+wobbly = true                  # floating windows wobble like jelly while u drag them
+panel_slide = true             # the bar slides up out of the way when a window goes fullscreen
 
 # mod+n folds the window into a small marker and u click the marker to get it back
 [collapse]
-auto_after_minutes = 0         # also collapse floating windows off screen that went unused this long and 0 means never
+auto = false                   # also collapse floating windows off screen that went unused for a while
+auto_after_minutes = 30        # how long they sit there unused first
 
 # the layout gets saved to ~/.local/state/sevenwm/session.json so windows go back to their spots after a restart
 [session]
@@ -219,16 +244,17 @@ restore_within_seconds = 120   # windows opening later than this after startup g
 # hide_from_screencast = true
 
 [screenshot]
-# runs on mod+shift+s and it should pick an area and capture it
-command = "grim -g \"$(slurp -d)\" - | wl-copy --type image/png"
-freeze = true                  # show a still of the screen while u pick
+# runs on mod+shift+s and sevenshells picker freezes the screen itself
+# or use ur own like "grim -g \"$(slurp -d)\" - | wl-copy --type image/png" w freeze on
+command = "sevenshell screenshot"
+freeze = false                 # show a still of the screen while u pick
 
 [keybindings]
 "mod+t" = "exec kitty"
 "mod+q" = "close-window"
 "mod+d" = "exec sevenshell launcher"
 "mod+g" = "exec sevenshell windows"     # find an open window by name
-"mod+m" = "quit"
+"mod+shift+m" = "quit"             # shift so u dont quit by accident
 "alt+tab" = "cycle-windows"
 "mod+tab" = "overview"
 "mod+equal" = "zoom-in"            # the + key
@@ -242,6 +268,9 @@ freeze = true                  # show a still of the screen while u pick
 "mod+s" = "home"
 "mod+n" = "collapse"
 "mod+ctrl+f" = "center-window"    # center the focused window at 100% zoom
+"mod+o" = "origin"                # fly back to 0 0 at 100% zoom
+"mod+ctrl+o" = "window-to-origin" # move the focused window to 0 0
+"mod+alt+o" = "workspace-to-origin" # move the workspace ur on to 0 0
 "mod+1" = "workspace 1"
 "mod+2" = "workspace 2"
 "mod+3" = "workspace 3"
@@ -262,7 +291,7 @@ freeze = true                  # show a still of the screen while u pick
 "mod+shift+8" = "move-to-workspace 8"
 "mod+shift+9" = "move-to-workspace 9"
 "mod+shift+0" = "move-to-workspace 10"
-"mod+e" = "exec thunar"
+"mod+e" = "exec gtk-launch \"$(xdg-mime query default inode/directory)\""
 "mod+w" = "exec gtk-launch \"$(xdg-settings get default-web-browser)\""
 "mod+shift+s" = "screenshot"
 "mod+f" = "toggle-fullscreen"
@@ -271,13 +300,18 @@ freeze = true                  # show a still of the screen while u pick
 "mod+ctrl+space" = "toggle-tiling"
 "mod+r" = "relaunch-window"
 "mod+shift+r" = "reload-config"
-"mod+i" = "exec sevenwm-settings"
+"mod+i" = "exec sevenshell settings"
 "mod+escape" = "exec sevenshell lock"
+"ctrl+shift+escape" = "exec sevenshell taskmanager"  # like windows
 "mod+slash" = "exec sevenshell keybinds"
+"mod+v" = "exec sevenshell clipboard"       # like windows
+"mod+period" = "exec sevenshell emoji"
+"mod+a" = "exec sevenshell quick"           # quick settings like the clock opens
+"mod+shift+escape" = "exec sevenshell session"  # lock log out suspend reboot or shut down
 "mod+shift+t" = "exec-outside kitty"   # these four open beside the workspace
 "mod+shift+w" = "exec-outside gtk-launch \"$(xdg-settings get default-web-browser)\""
-"mod+shift+e" = "exec-outside thunar"
-"mod+shift+i" = "exec-outside sevenwm-settings"
+"mod+shift+e" = "exec-outside gtk-launch \"$(xdg-mime query default inode/directory)\""
+"mod+shift+i" = "exec-outside sevenshell settings"
 
 "mod+h" = "focus left"
 "mod+k" = "focus up"

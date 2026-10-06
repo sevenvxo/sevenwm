@@ -5,6 +5,7 @@
 //! action toggle-tiling runs any keybind action
 //! focus 12 focuses a window by id and flies to it
 //! fly_to x 0.0 y 0.0 zoom 1.0 moves the view
+//! caffeine true false or toggle keeps the screen awake
 //! replies are ok or error and the path is in SEVENWM_SOCK
 
 use std::cell::Cell;
@@ -12,12 +13,14 @@ use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use smithay::desktop::Window;
 use smithay::reexports::calloop::generic::Generic;
+use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{EventLoop, Interest, Mode, PostAction};
-use smithay::utils::Point;
+use smithay::utils::{Logical, Point, Rectangle};
 
 use crate::config::Action;
 use crate::state::Seven;
@@ -40,8 +43,25 @@ pub struct Subscriber {
     pending: Vec<u8>,
 }
 
+/// a request line longer than this gets the client hung up on
+const MAX_REQUEST: usize = 1 << 20;
+
+/// how long a reply may wait for a client thats slow to read before its dropped
+const REPLY_TIMEOUT: Duration = Duration::from_millis(250);
+
 /// a subscriber this far behind gets dropped so it reconnects
 const MAX_PENDING: usize = 4 << 20;
+
+/// the most often subscribers hear about a change which is plenty for a bar and a minimap
+const IPC_INTERVAL: Duration = Duration::from_millis(33);
+
+/// damage and cameras as of the last state built
+#[derive(PartialEq)]
+pub struct IpcStamp {
+    damage: u64,
+    active: Option<String>,
+    views: Vec<[f64; 3]>,
+}
 
 impl Subscriber {
     /// queue text and send what the socket takes or false if the subscriber is prolly gone
@@ -93,7 +113,6 @@ pub fn listen(
                                 Ok(_) if line.ends_with(b"\n") => {
                                     let text = String::from_utf8_lossy(&line).into_owned();
                                     line.clear();
-                                    state.damage();
                                     let reply = state.ipc_request(text.trim(), stream);
                                     if let Some(reply) = reply
                                         && write_line(stream, &reply).is_err()
@@ -103,6 +122,10 @@ pub fn listen(
                                 }
                                 // the stream ended mid line
                                 Ok(_) => return Ok(PostAction::Remove),
+                                // no newline in sight so its not talking json lines and cant fill our memory
+                                Err(err) if err.kind() == ErrorKind::WouldBlock && line.len() > MAX_REQUEST => {
+                                    return Ok(PostAction::Remove);
+                                }
                                 Err(err) if err.kind() == ErrorKind::WouldBlock => {
                                     return Ok(PostAction::Continue);
                                 }
@@ -121,10 +144,16 @@ pub fn listen(
     Ok(path)
 }
 
+/// send a whole reply even if its bigger than the socket buffer but never wait long on a stuck client
 fn write_line(mut stream: &UnixStream, value: &Value) -> std::io::Result<()> {
     let mut text = value.to_string();
     text.push('\n');
-    stream.write_all(text.as_bytes())
+    // nonblocking would cut a big state reply off halfway so block for a bit instead
+    stream.set_nonblocking(false)?;
+    stream.set_write_timeout(Some(REPLY_TIMEOUT))?;
+    let written = stream.write_all(text.as_bytes());
+    stream.set_nonblocking(true)?;
+    written
 }
 
 impl Seven {
@@ -175,6 +204,10 @@ impl Seven {
         }
         if let Some(action) = request.get("action").and_then(Value::as_str) {
             return Some(match Action::parse(action) {
+                // behind the lock only commands run like w the keys
+                Ok(action) if self.is_locked() && !matches!(action, Action::Exec(_)) => {
+                    json!({ "error": "the screen is locked" })
+                }
                 Ok(action) => {
                     self.run_action(action);
                     json!({ "ok": null })
@@ -183,6 +216,11 @@ impl Seven {
             });
         }
         if let Some(id) = request.get("focus").and_then(Value::as_u64) {
+            // nothing moves behind the lock screen
+            if self.is_locked() {
+                return Some(json!({ "error": "the screen is locked" }));
+            }
+            self.damage();
             let window = self
                 .space
                 .elements()
@@ -198,7 +236,44 @@ impl Seven {
                 None => json!({ "error": format!("no window {id}") }),
             });
         }
+        // a shells palette for borders menus and title bars or null to go back to the config
+        // caffeine true false or toggle keeps the screen from going idle
+        if let Some(value) = request.get("caffeine") {
+            self.caffeine = match value {
+                Value::Bool(on) => *on,
+                Value::String(s) if s == "toggle" => !self.caffeine,
+                _ => return Some(json!({ "error": "caffeine needs true false or \"toggle\"" })),
+            };
+            self.damage();
+            return Some(json!({ "ok": self.caffeine }));
+        }
+        if let Some(colors) = request.get("colors") {
+            let colors = match colors {
+                Value::Null => None,
+                Value::Object(map) => Some(map.clone()),
+                _ => return Some(json!({ "error": "colors needs an object or null" })),
+            };
+            match &colors {
+                Some(map) => {
+                    // js paint the new colors on the config in use instead of rereading the whole file
+                    if let Err(err) = self.config.apply_colors(map) {
+                        return Some(json!({ "error": err }));
+                    }
+                    self.color_override = colors;
+                    self.damage();
+                }
+                None => {
+                    // back to the files own colors which needs the file
+                    self.color_override = None;
+                    self.reload_config();
+                }
+            }
+            return Some(json!({ "ok": null }));
+        }
         if let Some(target) = request.get("fly_to") {
+            if self.is_locked() {
+                return Some(json!({ "error": "the screen is locked" }));
+            }
             let x = target.get("x").and_then(Value::as_f64);
             let y = target.get("y").and_then(Value::as_f64);
             let zoom = target
@@ -211,6 +286,7 @@ impl Seven {
             let zoom = zoom.clamp(self.config.view.zoom_min, self.config.view.zoom_max);
             let duration = std::time::Duration::from_millis(self.config.view.fly_duration_ms);
             self.view.fly_to(Point::from((x, y)), zoom, duration);
+            self.damage();
             return Some(json!({ "ok": null }));
         }
         Some(json!({ "error": "unknown request" }))
@@ -266,40 +342,14 @@ impl Seven {
             .elements()
             .map(|window| {
                 let rect = self.frame(window).unwrap_or_default();
-                let (title, app_id) = crate::screencast::title_and_app_id(window);
-                json!({
-                    "id": window_id(window),
-                    "app_id": app_id,
-                    "title": title,
-                    "rect": [rect.loc.x, rect.loc.y, rect.size.w, rect.size.h],
-                    "tiled": self.is_tiled(window),
-                    "workspace": self.ws_of(window).map(|i| self.workspaces[i].number),
-                    "fullscreen": self.is_fullscreen(window),
-                    "focused": focused.as_ref() == Some(window),
-                    "hidden_from_screencast": crate::menu::hidden_from_capture(window),
-                    "pid": self.window_pid(window),
-                    "collapsed": false,
-                    "recent": self.history.iter().position(|w| w == window),
-                })
+                let workspace = self.ws_of(window).map(|i| self.workspaces[i].number);
+                self.window_json(window, rect, workspace, false, focused.as_ref() == Some(window))
             })
-            .chain(self.collapsed.iter().map(|c| {
-                let (title, app_id) = crate::screencast::title_and_app_id(&c.window);
-                let r = c.rect;
-                json!({
-                    "id": window_id(&c.window),
-                    "app_id": app_id,
-                    "title": title,
-                    "rect": [r.loc.x, r.loc.y, r.size.w, r.size.h],
-                    "tiled": false,
-                    "workspace": c.workspace,
-                    "fullscreen": false,
-                    "focused": false,
-                    "hidden_from_screencast": crate::menu::hidden_from_capture(&c.window),
-                    "pid": self.window_pid(&c.window),
-                    "collapsed": true,
-                    "recent": self.history.iter().position(|w| *w == c.window),
-                })
-            }))
+            .chain(
+                self.collapsed
+                    .iter()
+                    .map(|c| self.window_json(&c.window, c.rect, c.workspace, true, false)),
+            )
             .collect();
         let mut workspaces: Vec<Value> = self
             .workspaces
@@ -321,19 +371,90 @@ impl Seven {
             "workspaces": workspaces,
             "windows": windows,
             "locked": self.is_locked(),
+            "caffeine": self.caffeine,
+            // an app holding the screen awake like a video
+            "inhibited": !self.idle_inhibitors.is_empty(),
+            // something copied the screen in the last 2 secs like a screen share
+            "capturing": self.last_capture.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(2)),
+            "night_light": self.night_light_wanted().is_some(),
+            "night_light_enabled": self.config.night_light.enabled,
+            "anti_flashbang": self.config.anti_flashbang.enabled,
         })
     }
 
-    /// after a frame send the state to subscribers if it changed
+    /// one window like the shell sees it and a collapsed one keeps the rect it had
+    fn window_json(
+        &self,
+        window: &Window,
+        rect: Rectangle<i32, Logical>,
+        workspace: Option<u32>,
+        collapsed: bool,
+        focused: bool,
+    ) -> Value {
+        let (title, app_id) = crate::screencast::title_and_app_id(window);
+        json!({
+            "id": window_id(window),
+            "app_id": app_id,
+            "title": title,
+            "rect": [rect.loc.x, rect.loc.y, rect.size.w, rect.size.h],
+            "tiled": !collapsed && self.is_tiled(window),
+            "workspace": workspace,
+            "fullscreen": !collapsed && self.is_fullscreen(window),
+            "focused": focused,
+            "hidden_from_screencast": crate::menu::hidden_from_capture(window),
+            "always_on_top": crate::menu::always_on_top(window),
+            "pid": self.window_pid(window),
+            "collapsed": collapsed,
+            "recent": self.history.iter().position(|w| w == window),
+        })
+    }
+
+    /// what the state depends on that can change without damage so a frame that moved none of it skips the rebuild
+    fn ipc_stamp(&self) -> IpcStamp {
+        let view = |v: &crate::view::View| [v.camera.x, v.camera.y, v.zoom];
+        IpcStamp {
+            damage: self.damage_gen.get(),
+            active: self.output.as_ref().map(|o| o.name()),
+            views: std::iter::once(view(&self.view))
+                .chain(self.monitors.iter().map(|m| view(&m.view)))
+                .collect(),
+        }
+    }
+
+    /// after a frame send the state to subscribers if it changed but at most every IPC_INTERVAL
     pub fn ipc_notify(&mut self) {
         if self.subscribers.is_empty() {
             return;
         }
+        // still uhh finish sending what a full socket held back
+        self.subscribers
+            .retain_mut(|s| s.pending.is_empty() || keep(s, &[]));
+        let stamp = self.ipc_stamp();
+        if self.ipc_stamp.as_ref() == Some(&stamp) {
+            return;
+        }
+        // a flying camera changes every frame so the shell gets it at its own pace and a timer sends the last one
+        let now = Instant::now();
+        if let Some(built) = self.ipc_built
+            && now < built + IPC_INTERVAL
+        {
+            if !self.ipc_timer {
+                self.ipc_timer = true;
+                let _ = self.loop_handle.insert_source(
+                    Timer::from_duration(built + IPC_INTERVAL - now),
+                    |_, _, state| {
+                        state.ipc_timer = false;
+                        state.ipc_notify();
+                        TimeoutAction::Drop
+                    },
+                );
+            }
+            return;
+        }
+        self.ipc_built = Some(now);
+        self.ipc_stamp = Some(stamp);
         let state = self.ipc_state();
         if self.ipc_last.as_ref() == Some(&state) {
-            // still uhh finish sending what a full socket held back
-            self.subscribers
-                .retain_mut(|s| s.pending.is_empty() || keep(s, &[]));
             return;
         }
         let text = format!("{}\n", json!({ "state": state }));

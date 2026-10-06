@@ -37,6 +37,15 @@ impl Direction {
             Self::Right => (1, 0),
         }
     }
+
+    pub fn opposite(self) -> Self {
+        match self {
+            Self::Left => Self::Right,
+            Self::Down => Self::Up,
+            Self::Up => Self::Down,
+            Self::Right => Self::Left,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -68,6 +77,9 @@ pub enum Action {
     RemoveWorkspace,
     ToggleCollapse,
     CenterWindow,
+    GoToOrigin,
+    WindowToOrigin,
+    WorkspaceToOrigin,
     /// close the window menu on escape and u cant bind it
     CloseMenu,
 }
@@ -115,6 +127,9 @@ impl Action {
             "remove-workspace" => Self::RemoveWorkspace,
             "collapse" => Self::ToggleCollapse,
             "center-window" => Self::CenterWindow,
+            "origin" => Self::GoToOrigin,
+            "window-to-origin" => Self::WindowToOrigin,
+            "workspace-to-origin" => Self::WorkspaceToOrigin,
             other => return Err(format!("unknown action '{other}'")),
         })
     }
@@ -208,6 +223,8 @@ struct RawConfig {
     xwayland: Xwayland,
     input: Input,
     idle: Idle,
+    night_light: NightLight,
+    anti_flashbang: AntiFlashbang,
     border: RawBorder,
     decorations: RawDecorations,
     cursor: Cursor,
@@ -274,12 +291,18 @@ pub struct Animations {
     pub close_curve: crate::animation::Curve,
     /// the view flying somewhere
     pub fly_curve: crate::animation::Curve,
+    /// floating windows bend like jelly while u drag them
+    pub wobbly: bool,
+    /// the bar slides away over a fullscreen window instead of js getting covered
+    pub panel_slide: bool,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Collapse {
-    /// collapse floating windows off screen and unfocused this long and 0 means never
+    /// collapse floating windows left off screen and unfocused on its own
+    pub auto: bool,
+    /// how long they sit there first
     pub auto_after_minutes: u64,
 }
 
@@ -395,6 +418,54 @@ pub struct Idle {
     /// locks the screen on idle and again if the lock screen dies while locked
     pub lock_command: String,
     pub suspend_command: String,
+}
+
+/// warmer colors thru the monitors gamma so its easier on the eyes at night
+#[derive(Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct NightLight {
+    pub enabled: bool,
+    /// kelvin where 6500 is normal and lower is warmer
+    pub temperature: u32,
+    /// hh:mm it turns on and off and both empty means the whole time its enabled
+    pub from: String,
+    pub until: String,
+}
+
+impl NightLight {
+    /// whether it should be warm right now at minute of the day now
+    pub fn active_at(&self, now: u32) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        match (hhmm(&self.from), hhmm(&self.until)) {
+            (Some(from), Some(until)) if from != until => {
+                // a span over midnight like 20:00 to 07:00 wraps
+                if from < until {
+                    (from..until).contains(&now)
+                } else {
+                    now >= from || now < until
+                }
+            }
+            _ => true,
+        }
+    }
+}
+
+/// minutes since midnight from hh:mm
+pub fn hhmm(text: &str) -> Option<u32> {
+    let (h, m) = text.trim().split_once(':')?;
+    let (h, m): (u32, u32) = (h.parse().ok()?, m.parse().ok()?);
+    (h < 24 && m < 60).then_some(h * 60 + m)
+}
+
+/// dims the brightest parts of windows so a white page cant blind u in the dark
+#[derive(Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AntiFlashbang {
+    pub enabled: bool,
+    /// how bright a pixel can get from 0.05 to 1
+    pub max_brightness: f32,
 }
 
 #[derive(Deserialize)]
@@ -584,6 +655,10 @@ pub struct Placement {
     pub new_windows: NewWindows,
     /// size a new floating window gets if it doesnt pick one
     pub float_size: [i32; 2],
+    /// app id globs that tile or snap like before while other apps float centered
+    pub tile_apps: Vec<String>,
+    /// a new floating window this close to the screen size in px on both sides gets maximized and 0 means never
+    pub maximize_tolerance: i32,
 }
 
 #[derive(Deserialize)]
@@ -602,6 +677,10 @@ pub struct View {
     pub zoom_step: f64,
     pub fly_duration_ms: u64,
     pub focus_follows_view: bool,
+    pub focus_follows_mouse: bool,
+    pub mouse_follows_focus: bool,
+    /// mod+arrow from a tile can pick windows outside its workspace
+    pub focus_leaves_workspace: bool,
     pub drag_empty_canvas_pans: bool,
     /// held w mod to pan over windows like alt
     pub pan_modifier: String,
@@ -629,6 +708,8 @@ pub struct Config {
     pub xwayland: Xwayland,
     pub input: Input,
     pub idle: Idle,
+    pub night_light: NightLight,
+    pub anti_flashbang: AntiFlashbang,
     pub border: Border,
     pub decorations: Decorations,
     pub cursor: Cursor,
@@ -657,6 +738,61 @@ fn merge(base: &mut toml::Table, over: toml::Table) {
                 base.insert(key, value);
             }
         }
+    }
+}
+
+/// where one pushable color lives in the config
+enum ColorSlot<'a> {
+    /// drawn by the gpu as floats
+    Gpu(&'a mut Color),
+    /// drawn on the cpu as bytes
+    Cpu(&'a mut [u8; 4]),
+}
+
+impl Config {
+    /// every color a shell can push over ipc by its config key
+    fn color_slot(&mut self, key: &str) -> Option<ColorSlot<'_>> {
+        use ColorSlot::{Cpu, Gpu};
+        Some(match key {
+            "border.focused" => Gpu(&mut self.border.focused),
+            "border.unfocused" => Gpu(&mut self.border.unfocused),
+            "canvas.background" => Gpu(&mut self.canvas.background),
+            "canvas.region_outline" => Gpu(&mut self.canvas.region_outline),
+            "canvas.bounds_outline" => Gpu(&mut self.canvas.bounds_outline),
+            "canvas.drop_highlight" => Gpu(&mut self.canvas.drop_highlight),
+            "decorations.shadow_color" => Gpu(&mut self.decorations.shadow_color),
+            "decorations.titlebar_focused" => Cpu(&mut self.decorations.titlebar_focused),
+            "decorations.titlebar_unfocused" => Cpu(&mut self.decorations.titlebar_unfocused),
+            "decorations.titlebar_text" => Cpu(&mut self.decorations.titlebar_text),
+            "theme.menu_background" => Cpu(&mut self.theme.menu_background),
+            "theme.menu_text" => Cpu(&mut self.theme.menu_text),
+            "theme.menu_hover" => Cpu(&mut self.theme.menu_hover),
+            "theme.menu_disabled" => Cpu(&mut self.theme.menu_disabled),
+            "theme.menu_edge" => Cpu(&mut self.theme.menu_edge),
+            _ => return None,
+        })
+    }
+
+    /// colors a shell pushed over ipc like its wallpaper palette laid over the files ones
+    /// and all of them get checked first so a bad push changes nothing
+    pub fn apply_colors(&mut self, colors: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
+        let mut parsed = Vec::with_capacity(colors.len());
+        for (key, value) in colors {
+            let s = value.as_str().ok_or_else(|| format!("{key}: expected a color string"))?;
+            let color = parse_color(s).map_err(|e| format!("{key}: {e}"))?;
+            if self.color_slot(key).is_none() {
+                return Err(format!("no color called {key}"));
+            }
+            parsed.push((key, s, color));
+        }
+        for (key, s, color) in parsed {
+            match self.color_slot(key) {
+                Some(ColorSlot::Gpu(slot)) => *slot = color,
+                Some(ColorSlot::Cpu(slot)) => *slot = rgba_bytes(s, key)?,
+                None => {}
+            }
+        }
+        Ok(())
     }
 }
 
@@ -716,7 +852,7 @@ impl Config {
         self.session.restore = false;
         self.idle.lock_after = 0;
         self.idle.suspend_after = 0;
-        self.collapse.auto_after_minutes = 0;
+        self.collapse.auto = false;
     }
 
     pub fn path() -> Option<PathBuf> {
@@ -945,6 +1081,22 @@ impl Config {
                 raw.monitors
             },
             idle: raw.idle,
+            night_light: {
+                let n = &raw.night_light;
+                for (name, value) in [("from", &n.from), ("until", &n.until)] {
+                    if !value.trim().is_empty() && hhmm(value).is_none() {
+                        return Err(format!("night_light.{name} should be hh:mm like 20:00 or empty not '{value}'"));
+                    }
+                }
+                NightLight {
+                    temperature: n.temperature.clamp(1000, 6500),
+                    ..raw.night_light
+                }
+            },
+            anti_flashbang: AntiFlashbang {
+                max_brightness: raw.anti_flashbang.max_brightness.clamp(0.05, 1.0),
+                ..raw.anti_flashbang
+            },
             cursor: raw.cursor,
             border: Border {
                 width: raw.border.width.max(0),
@@ -1002,6 +1154,11 @@ impl Config {
         merged
     }
 
+    /// whether an app is one of the tile_apps like a terminal
+    pub fn tiles_app(&self, app_id: &str) -> bool {
+        self.placement.tile_apps.iter().any(|p| glob(p, app_id))
+    }
+
     pub fn lookup(&self, mods: Mods, key: Keysym) -> Option<&Action> {
         self.bindings.get(&KeyCombo { mods, key })
     }
@@ -1041,14 +1198,36 @@ mod tests {
     }
 
     #[test]
-    fn hjkl_is_left_up_down_right_and_mod_m_quits() {
+    fn a_bad_color_push_changes_nothing() {
+        let mut config = Config::from_toml("", false).unwrap();
+        let before = config.border.focused;
+        let push = |v: serde_json::Value| v.as_object().unwrap().clone();
+        let bad = push(serde_json::json!({ "border.focused": "#ff0000", "nope": "#00ff00" }));
+        assert!(config.apply_colors(&bad).is_err());
+        assert_eq!(config.border.focused, before);
+        let good = push(serde_json::json!({ "border.focused": "#ff0000", "theme.menu_text": "#00ff00" }));
+        assert!(config.apply_colors(&good).is_ok());
+        assert_eq!(config.border.focused, [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(config.theme.menu_text, [0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn hjkl_is_left_up_down_right_and_mod_shift_m_quits() {
         let config = Config::from_toml("", false).unwrap();
         let focus = |key| config.lookup(SUPER, Keysym::new(key)).cloned();
         assert_eq!(focus(keysyms::KEY_h), Some(Action::Focus(Direction::Left)));
         assert_eq!(focus(keysyms::KEY_j), Some(Action::Focus(Direction::Down)));
         assert_eq!(focus(keysyms::KEY_k), Some(Action::Focus(Direction::Up)));
         assert_eq!(focus(keysyms::KEY_l), Some(Action::Focus(Direction::Right)));
-        assert_eq!(focus(keysyms::KEY_m), Some(Action::Quit));
+        assert_eq!(focus(keysyms::KEY_m), None);
+        let shift = Mods {
+            shift: true,
+            ..SUPER
+        };
+        assert_eq!(
+            config.lookup(shift, Keysym::new(keysyms::KEY_m)),
+            Some(&Action::Quit)
+        );
     }
 
     #[test]

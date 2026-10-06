@@ -88,8 +88,10 @@ impl WindowDrag {
         match self.kind {
             DragKind::Move => {
                 let mut rect = Rectangle::new(self.initial.loc + delta, self.initial.size);
+                // an always on top window cant tile so it js floats over the workspace
                 state.drop_target = state
                     .workspace_at(pointer)
+                    .filter(|_| !crate::menu::always_on_top(&self.window))
                     .map(|i| state.workspaces[i].number);
                 // over a workspace the window is about to tile so no snapping
                 if state.config.snap.enabled && state.drop_target.is_none() {
@@ -148,76 +150,59 @@ impl WindowDrag {
     }
 }
 
-/// every gesture passes straight thru a grab
-macro_rules! forward_gestures {
-    () => {
-        fn gesture_swipe_begin(
+/// every gesture handler a grab needs each made by how
+macro_rules! gesture_handlers {
+    ($how:ident) => {
+        crate::grabs::$how!(gesture_swipe_begin, GestureSwipeBeginEvent);
+        crate::grabs::$how!(gesture_swipe_update, GestureSwipeUpdateEvent);
+        crate::grabs::$how!(gesture_swipe_end, GestureSwipeEndEvent);
+        crate::grabs::$how!(gesture_pinch_begin, GesturePinchBeginEvent);
+        crate::grabs::$how!(gesture_pinch_update, GesturePinchUpdateEvent);
+        crate::grabs::$how!(gesture_pinch_end, GesturePinchEndEvent);
+        crate::grabs::$how!(gesture_hold_begin, GestureHoldBeginEvent);
+        crate::grabs::$how!(gesture_hold_end, GestureHoldEndEvent);
+    };
+}
+
+macro_rules! forward_gesture {
+    ($name:ident, $event:ident) => {
+        fn $name(
             &mut self,
             data: &mut Seven,
             handle: &mut PointerInnerHandle<'_, Seven>,
-            event: &smithay::input::pointer::GestureSwipeBeginEvent,
+            event: &smithay::input::pointer::$event,
         ) {
-            handle.gesture_swipe_begin(data, event);
-        }
-        fn gesture_swipe_update(
-            &mut self,
-            data: &mut Seven,
-            handle: &mut PointerInnerHandle<'_, Seven>,
-            event: &smithay::input::pointer::GestureSwipeUpdateEvent,
-        ) {
-            handle.gesture_swipe_update(data, event);
-        }
-        fn gesture_swipe_end(
-            &mut self,
-            data: &mut Seven,
-            handle: &mut PointerInnerHandle<'_, Seven>,
-            event: &smithay::input::pointer::GestureSwipeEndEvent,
-        ) {
-            handle.gesture_swipe_end(data, event);
-        }
-        fn gesture_pinch_begin(
-            &mut self,
-            data: &mut Seven,
-            handle: &mut PointerInnerHandle<'_, Seven>,
-            event: &smithay::input::pointer::GesturePinchBeginEvent,
-        ) {
-            handle.gesture_pinch_begin(data, event);
-        }
-        fn gesture_pinch_update(
-            &mut self,
-            data: &mut Seven,
-            handle: &mut PointerInnerHandle<'_, Seven>,
-            event: &smithay::input::pointer::GesturePinchUpdateEvent,
-        ) {
-            handle.gesture_pinch_update(data, event);
-        }
-        fn gesture_pinch_end(
-            &mut self,
-            data: &mut Seven,
-            handle: &mut PointerInnerHandle<'_, Seven>,
-            event: &smithay::input::pointer::GesturePinchEndEvent,
-        ) {
-            handle.gesture_pinch_end(data, event);
-        }
-        fn gesture_hold_begin(
-            &mut self,
-            data: &mut Seven,
-            handle: &mut PointerInnerHandle<'_, Seven>,
-            event: &smithay::input::pointer::GestureHoldBeginEvent,
-        ) {
-            handle.gesture_hold_begin(data, event);
-        }
-        fn gesture_hold_end(
-            &mut self,
-            data: &mut Seven,
-            handle: &mut PointerInnerHandle<'_, Seven>,
-            event: &smithay::input::pointer::GestureHoldEndEvent,
-        ) {
-            handle.gesture_hold_end(data, event);
+            handle.$name(data, event);
         }
     };
 }
-pub(crate) use forward_gestures;
+
+macro_rules! swallow_gesture {
+    ($name:ident, $event:ident) => {
+        fn $name(
+            &mut self,
+            _: &mut Seven,
+            _: &mut PointerInnerHandle<'_, Seven>,
+            _: &smithay::input::pointer::$event,
+        ) {
+        }
+    };
+}
+
+/// every gesture passes straight thru a grab
+macro_rules! forward_gestures {
+    () => {
+        crate::grabs::gesture_handlers!(forward_gesture);
+    };
+}
+
+/// every gesture stops at the grab and never reaches a client
+macro_rules! swallow_gestures {
+    () => {
+        crate::grabs::gesture_handlers!(swallow_gesture);
+    };
+}
+pub(crate) use {forward_gesture, forward_gestures, gesture_handlers, swallow_gesture, swallow_gestures};
 
 impl PointerGrab<Seven> for WindowDrag {
     fn motion(
@@ -240,6 +225,7 @@ impl PointerGrab<Seven> for WindowDrag {
         if std::mem::take(&mut self.lift_tile) && self.still_draggable(data) {
             data.untile(&self.window);
             data.space.raise_element(&self.window, true);
+            data.restack();
         }
         self.apply(data, event.location);
     }
@@ -287,6 +273,7 @@ impl PointerGrab<Seven> for WindowDrag {
 
     fn unset(&mut self, data: &mut Seven) {
         data.dragging = None;
+        crate::wobbly::release(&self.window);
         match self.kind {
             DragKind::Move => {
                 if let Some(number) = data.drop_target.take()
@@ -297,7 +284,7 @@ impl PointerGrab<Seven> for WindowDrag {
                     data.tile_sized(&self.window, i, Some(at));
                     data.focus(Some(&self.window));
                 }
-                // in the overview a mod click picks the window like a plain click
+                // in the overview a click without really dragging picks the window
                 if self.moved < CLICK_SLOP && data.overview.is_some() && self.window.alive() {
                     data.leave_overview_to(&self.window);
                 }

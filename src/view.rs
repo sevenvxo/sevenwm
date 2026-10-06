@@ -98,6 +98,8 @@ impl View {
         // zoom blends on a log scale so a curve that overshoots cant push it to zero or below
         self.zoom = from_zoom.max(1e-6) * (to_zoom.max(1e-6) / from_zoom.max(1e-6)).powf(eased);
         if t >= 1.0 {
+            // land right on the target bc the blend can end a hair off and a fullscreen window checks for an exact match
+            (self.camera, self.zoom) = (to_cam, to_zoom);
             self.flight = None;
         }
         true
@@ -155,6 +157,16 @@ mod tests {
         assert!(view.tick(Instant::now(), curve));
         assert_eq!((view.camera, view.zoom), (Point::from((500.0, 500.0)), 0.5));
         assert!(!view.tick(Instant::now(), curve), "the flight is over");
+    }
+
+    #[test]
+    fn a_flight_from_an_odd_spot_lands_exactly() {
+        let mut view = View::default();
+        view.set(Point::from((0.1, -1234.567)), 0.7);
+        let start = Instant::now();
+        view.fly_to(Point::from((0.3, 1920.0)), 1.0, Duration::from_millis(10));
+        view.tick(start + Duration::from_millis(20), crate::animation::Curve::Linear);
+        assert_eq!((view.camera, view.zoom), (Point::from((0.3, 1920.0)), 1.0));
     }
 
     #[test]

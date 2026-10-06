@@ -14,7 +14,7 @@ pub struct Monitor {
     pub view: View,
     /// its home workspace number
     pub home: u32,
-    pub overview: Option<(Point<f64, Logical>, f64)>,
+    pub overview: Option<crate::tiling::Overview>,
 }
 
 pub fn size_of(output: &Output) -> Size<i32, Logical> {
@@ -28,12 +28,10 @@ pub fn size_of(output: &Output) -> Size<i32, Logical> {
 
 impl Seven {
     /// every monitor output w the active one first
-    pub fn outputs(&self) -> Vec<Output> {
+    pub fn outputs(&self) -> impl Iterator<Item = &Output> {
         self.output
             .iter()
-            .cloned()
-            .chain(self.monitors.iter().map(|m| m.output.clone()))
-            .collect()
+            .chain(self.monitors.iter().map(|m| &m.output))
     }
 
     /// every monitor rect in the uhhhh layout
@@ -114,7 +112,7 @@ impl Seven {
     /// after a config change put every monitor where its entry says and apply scales
     pub fn arrange_monitors(&mut self) {
         let active = self.output.clone();
-        let outputs = self.outputs();
+        let outputs: Vec<Output> = self.outputs().cloned().collect();
         for output in &outputs {
             self.apply_scale(output);
         }
@@ -303,8 +301,8 @@ impl Seven {
             window.with_surfaces(|_, states| set(states, scale));
         }
         for output in self.outputs() {
-            let scale = scale_of(&output);
-            let layers: Vec<_> = smithay::desktop::layer_map_for_output(&output)
+            let scale = scale_of(output);
+            let layers: Vec<_> = smithay::desktop::layer_map_for_output(output)
                 .layers()
                 .cloned()
                 .collect();
@@ -317,7 +315,6 @@ impl Seven {
     /// the scale sevenwm draws its own pictures at which is the highest monitor scale rounded up
     pub fn ui_scale(&self) -> i32 {
         self.outputs()
-            .iter()
             .map(|o| o.current_scale().fractional_scale())
             .fold(1.0, f64::max)
             .ceil()
@@ -326,10 +323,9 @@ impl Seven {
 
     /// the monitor the pointer is on
     pub fn pointer_monitor(&self) -> Option<Output> {
-        let outputs = self.outputs();
         self.pointer_output
             .as_ref()
-            .and_then(|name| outputs.iter().find(|o| o.name() == *name).cloned())
+            .and_then(|name| self.outputs().find(|o| o.name() == *name).cloned())
             .or_else(|| self.output.clone())
     }
 

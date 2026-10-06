@@ -75,6 +75,10 @@ impl Seven {
 
     /// the marker under a screen point topmost first
     pub fn marker_at(&self, screen: Point<f64, Logical>) -> Option<usize> {
+        // a fullscreen window covers the markers so they cant be clicked thru it
+        if self.covering_fullscreen().is_some() {
+            return None;
+        }
         (0..self.collapsed.len())
             .rev()
             .find(|&i| self.marker_rect(self.collapsed[i].anchor).contains(screen))
@@ -252,7 +256,7 @@ impl Seven {
     /// once a sec collapse floating windows left off screen and unfocused for too long
     pub fn auto_collapse(&mut self) {
         let minutes = self.config.collapse.auto_after_minutes;
-        if minutes == 0 || self.is_locked() {
+        if !self.config.collapse.auto || minutes == 0 || self.is_locked() {
             return;
         }
         let limit = Duration::from_secs(minutes * 60);

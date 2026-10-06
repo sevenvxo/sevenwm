@@ -156,6 +156,36 @@ pub fn init(
 
     warn_about_other_gpus(&hw.borrow().node, state, &mut Vec::new());
 
+    // night light scales every monitors gamma ramp
+    let for_gamma = hw.clone();
+    state.gamma_hook = Some(Box::new(move |factors| {
+        let hw = for_gamma.borrow();
+        if !hw.active {
+            return false;
+        }
+        let mut ok = true;
+        for crtc in hw.screens.keys() {
+            let size = match hw.drm.get_crtc(*crtc) {
+                Ok(info) => info.gamma_length() as usize,
+                Err(_) => 0,
+            };
+            if size < 2 {
+                continue;
+            }
+            let [r, g, b] = factors.unwrap_or([1.0; 3]);
+            let (r, g, b) = (
+                crate::display::ramp(size, r),
+                crate::display::ramp(size, g),
+                crate::display::ramp(size, b),
+            );
+            if let Err(err) = hw.drm.set_gamma(*crtc, &r, &g, &b) {
+                tracing::debug!("setting gamma: {err}");
+                ok = false;
+            }
+        }
+        ok
+    }));
+
     // something changed so draw idle monitors now instead of at the next refresh check which made frames land late
     let (ping, ping_source) = make_ping()?;
     state.redraw = Some(ping);
@@ -245,7 +275,8 @@ pub fn init(
                     }
                     hw.screens.keys().copied().collect()
                 };
-                // monitors may have changed while we were away
+                // monitors may have changed while we were away and whoever had the vt may have reset the gamma
+                state.night_applied = None;
                 scan_monitors(&for_session, state, &session_handle);
                 for crtc in crtcs {
                     render(&for_session, crtc, state, &session_handle);
@@ -376,6 +407,8 @@ fn scan_monitors(hw: &Shared, state: &mut Seven, handle: &LoopHandle<'static, Se
                 match lit {
                     Ok(output) => {
                         state.add_monitor(&output);
+                        // a new monitor starts w normal gamma so night light goes on again
+                        state.night_applied = None;
                         render(hw, crtc, state, handle);
                     }
                     Err(err) => tracing::warn!("a monitor didn't light up: {err}"),
@@ -648,7 +681,7 @@ fn render(hw: &Shared, crtc: crtc::Handle, state: &mut Seven, handle: &LoopHandl
     if let Some(pointer_output) = state
         .pointer_output
         .clone()
-        .and_then(|name| state.outputs().into_iter().find(|o| o.name() == name))
+        .and_then(|name| state.outputs().find(|o| o.name() == name).cloned())
     {
         state.activate(&pointer_output);
     }

@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::utils::IsAlive;
 use smithay::wayland::idle_inhibit::IdleInhibitHandler;
 use smithay::wayland::idle_notify::{IdleNotifierHandler, IdleNotifierState};
 use smithay::wayland::session_lock::{
@@ -65,6 +66,7 @@ impl Seven {
         let after = self.config.idle.screen_off_after;
         after > 0
             && self.idle_inhibitors.is_empty()
+            && !self.caffeine
             // not till the lock screen is uhh drawn
             && !matches!(self.lock, Lock::Locking(_))
             && now.duration_since(self.last_activity) >= Duration::from_secs(after)
@@ -76,7 +78,15 @@ impl Seven {
     pub fn idle_tick(&mut self) {
         let now = Instant::now();
         let idle = now.duration_since(self.last_activity);
-        let held = !self.idle_inhibitors.is_empty();
+        // an app that died while keeping the screen awake never says its done so drop its surfaces here
+        let inhibitors = self.idle_inhibitors.len();
+        self.idle_inhibitors.retain(|s| s.alive());
+        if self.idle_inhibitors.len() != inhibitors {
+            let inhibited = !self.idle_inhibitors.is_empty();
+            self.idle_notifier_state.set_is_inhibited(inhibited);
+            self.last_activity = now;
+        }
+        let held = !self.idle_inhibitors.is_empty() || self.caffeine;
         let config = &self.config.idle;
         let reached = |after: u64| after > 0 && idle >= Duration::from_secs(after);
         if !held && !self.idle_locked && !self.is_locked() && reached(config.lock_after) {

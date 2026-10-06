@@ -13,7 +13,8 @@ use smithay::input::pointer::{
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::SERIAL_COUNTER;
-use smithay::utils::{Logical, Point};
+use smithay::desktop::Window;
+use smithay::utils::{Logical, Point, Rectangle, Size};
 use smithay::wayland::compositor::RegionAttributes;
 use smithay::wayland::pointer_constraints::{PointerConstraint, with_pointer_constraint};
 
@@ -165,13 +166,17 @@ impl Seven {
                     self.run_action(action);
                 }
             }
-            InputEvent::PointerMotion { event } => self.relative_motion::<I>(&event),
+            InputEvent::PointerMotion { event } => {
+                self.relative_motion::<I>(&event);
+                self.focus_under_pointer();
+            }
             InputEvent::PointerMotionAbsolute { event } => {
                 // nested theres one monitor and the host says where on it
                 let screen = self.screen_size();
                 let local = event.position_transformed(screen);
                 self.set_pointer_global(local + self.active_pos.to_f64());
                 self.pointer_moved(event.time());
+                self.focus_under_pointer();
             }
             InputEvent::PointerButton { event } => {
                 let pointer = self.seat.get_pointer().expect("the seat has a pointer");
@@ -312,6 +317,109 @@ impl Seven {
         self.pointer_moved(InputTime::now());
     }
 
+    /// only real mouse moves call this so a flying view never steals focus from a key pick
+    fn focus_under_pointer(&mut self) {
+        if !self.config.view.focus_follows_mouse
+            || self.is_locked()
+            || self.cycle.is_some()
+            || self.overview.is_some()
+            || self.menu.is_some()
+            || self.exclusive_layer().is_some()
+        {
+            return;
+        }
+        let pointer = self.seat.get_pointer().expect("the seat has a pointer");
+        if pointer.is_grabbed() {
+            return;
+        }
+        // a panel or launcher holding the keys keeps them
+        let keyboard = self.seat.get_keyboard().expect("the seat has a keyboard");
+        let focused = self.focused_window();
+        if keyboard.current_focus().is_some() && focused.is_none() {
+            return;
+        }
+        let Some(window) = self.window_under(self.pointer_screen) else {
+            return;
+        };
+        if focused.as_ref() == Some(&window) || self.is_collapsed(&window) {
+            return;
+        }
+        self.focus_hovered(&window);
+    }
+
+    /// move the mouse to a newly focused window once the view knows where its going
+    pub fn queue_warp(&mut self, window: &Window) {
+        // only tiles pull the mouse so floating windows on the canvas leave it alone
+        if !self.config.view.mouse_follows_focus || !self.is_tiled(window) {
+            return;
+        }
+        let first = self.warp_pending.is_none();
+        self.warp_pending = Some((window.clone(), 30));
+        // idle runs after this event so bring_into_view has already picked the camera
+        if first {
+            self.loop_handle.insert_idle(|state| state.warp_to_focus());
+        }
+    }
+
+    fn warp_to_focus(&mut self) {
+        let Some((window, tries)) = self.warp_pending.take() else {
+            return;
+        };
+        let pointer = self.seat.get_pointer().expect("the seat has a pointer");
+        if self.is_locked() || pointer.is_grabbed() || self.focused_window().as_ref() != Some(&window) {
+            return;
+        }
+        let Some(frame) = self.frame(&window) else {
+            return;
+        };
+        // a new window has no size till its first commit so check back in a bit
+        if frame.size.w <= 0 || frame.size.h <= 0 {
+            if tries > 0 {
+                self.warp_pending = Some((window, tries - 1));
+                let _ = self.loop_handle.insert_source(
+                    Timer::from_duration(Duration::from_millis(16)),
+                    |_, _, state| {
+                        state.warp_to_focus();
+                        TimeoutAction::Drop
+                    },
+                );
+            }
+            return;
+        }
+        let frame = frame.to_f64();
+        let to_canvas = |screen: Point<f64, Logical>, (camera, zoom): (Point<f64, Logical>, f64)| {
+            Point::from((screen.x / zoom + camera.x, screen.y / zoom + camera.y))
+        };
+        // the mouse is already on it like after a click so leave it be
+        if frame.contains(to_canvas(self.pointer_screen, self.view.destination())) {
+            return;
+        }
+        let centre = frame.loc + Point::from((frame.size.w / 2.0, frame.size.h / 2.0));
+        // the monitor that ends up showing it which is this one unless another already does
+        let mut screens = vec![(
+            self.active_pos.to_f64(),
+            self.view.destination(),
+            self.screen_size(),
+        )];
+        screens.extend(self.monitors.iter().map(|m| {
+            (m.pos.to_f64(), m.view.destination(), crate::monitors::size_of(&m.output))
+        }));
+        let (pos, (camera, zoom), _) = screens
+            .iter()
+            .copied()
+            .find(|(_, (camera, zoom), size)| {
+                let visible = Rectangle::new(
+                    *camera,
+                    Size::from((size.w as f64 / zoom, size.h as f64 / zoom)),
+                );
+                visible.contains(centre)
+            })
+            .unwrap_or(screens[0]);
+        let screen = Point::from(((centre.x - camera.x) * zoom, (centre.y - camera.y) * zoom));
+        self.set_pointer_global(pos + screen);
+        self.refresh_pointer();
+    }
+
     /// handle focus for a press and start a pan or drag if it asks for one
     fn press_starts_something(&mut self, button: u32, serial: smithay::utils::Serial) -> bool {
         let screen = self.pointer_screen;
@@ -319,7 +427,7 @@ impl Seven {
         let mods = self.held_mods();
         let mod_held = mods.contains(self.config.mod_mods);
 
-        // mod+ctrl+drag on a workspace moves it and its tiles
+        // mod+alt+drag on a workspace moves it and its tiles
         if button == BTN_LEFT
             && mods.contains(self.config.workspaces.drag_mods)
             && let Some(i) = self.workspace_at(canvas)
@@ -327,7 +435,7 @@ impl Seven {
             self.start_workspace_drag(i, button, serial);
             return true;
         }
-        // mod+alt+drag pans from anywhere even over a window
+        // mod+ctrl+drag pans from anywhere even over a window
         if button == BTN_LEFT && mods.contains(self.config.pan_mods) {
             self.start_pan(button, serial);
             return true;
@@ -367,13 +475,17 @@ impl Seven {
         }
         let window = self.window_under(screen);
 
-        // in the overview a click picks a window instead of using it
+        // in the overview a plain drag moves a window and a click picks it instead of using it
         if self.overview.is_some()
             && button == BTN_LEFT
             && !mod_held
             && let Some(window) = &window
         {
-            self.leave_overview_to(window);
+            if self.is_fullscreen(window) {
+                self.leave_overview_to(window);
+            } else {
+                self.start_drag(window.clone(), DragKind::Move, button, serial);
+            }
             return true;
         }
 

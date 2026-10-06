@@ -260,7 +260,9 @@ impl XdgShellHandler for Seven {
     /// the apps uhh maximize button or a double click on its header bar
     fn maximize_request(&mut self, surface: ToplevelSurface) {
         tracing::debug!("maximize request");
-        if let Some(window) = self.window_for_surface(surface.wl_surface()) {
+        if let Some(window) = self.window_for_surface(surface.wl_surface())
+            && !self.opening_wants_maximize(&window)
+        {
             self.maximize(&window);
         }
     }

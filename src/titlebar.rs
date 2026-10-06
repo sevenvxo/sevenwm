@@ -175,7 +175,11 @@ impl Seven {
                 }
             }
             Some(Button::Collapse) => self.collapse(&window),
-            Some(Button::Float) => self.toggle_floating(&window),
+            Some(Button::Float) => {
+                self.toggle_floating(&window);
+                // u clicked it so the mouse stays put instead of following the new tile
+                self.warp_pending = None;
+            }
             None => {
                 self.focus(Some(&window));
                 self.start_drag(window, crate::grabs::DragKind::Move, pointer_button, serial);
@@ -191,7 +195,7 @@ impl Seven {
         let tiled = self.is_tiled(window);
         let deco = &self.config.decorations;
         let key = (
-            title.clone(),
+            title,
             focused,
             frame.size.w,
             tiled,
@@ -208,6 +212,8 @@ impl Seven {
         {
             return Some(drawn.image.clone());
         }
+        // only a bar thats drawn again needs its own copy of the title
+        let title = key.0.clone();
 
         let deco = &self.config.decorations;
         // drawn at the monitor scale rounded up so its sharp

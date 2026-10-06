@@ -61,7 +61,8 @@ impl Seven {
             Action::Focus(dir) => self.focus_direction(dir),
             Action::Move(dir) => self.nudge_focused(dir),
             Action::Grow(dir) => self.resize_focused(dir, self.config.step),
-            Action::Shrink(dir) => self.resize_focused(dir, -self.config.step),
+            // the far edge comes in so shrink left pulls the right side over to the left
+            Action::Shrink(dir) => self.resize_focused(dir.opposite(), -self.config.step),
             Action::RelaunchWindow => self.relaunch_focused(),
             Action::ReloadConfig => self.reload_config(),
             Action::Home => self.fly_home(),
@@ -90,6 +91,9 @@ impl Seven {
                     self.center_window(&window);
                 }
             }
+            Action::GoToOrigin => self.go_to_origin(),
+            Action::WindowToOrigin => self.window_to_origin(),
+            Action::WorkspaceToOrigin => self.workspace_to_origin(),
         }
     }
 
@@ -107,6 +111,10 @@ impl Seven {
                 let titlebar_was = self.config.decorations.titlebar;
                 let ratio_was = self.config.tiling.split_ratio;
                 self.config = config;
+                if let Some(colors) = &self.color_override {
+                    // checked when it came in so this cant fail
+                    let _ = self.config.apply_colors(colors);
+                }
                 if self.greeter.is_some() {
                     self.config.restrict_for_greeter();
                 }
@@ -196,10 +204,16 @@ impl Seven {
                 visible.loc.y + visible.size.h / 2.0,
             )),
         };
+        // w focus_leaves_workspace off a tile only moves between tiles of its own workspace
+        let stay_in = current
+            .as_ref()
+            .filter(|_| !self.config.view.focus_leaves_workspace)
+            .and_then(|w| self.ws_of(w));
         let (windows, rects): (Vec<Window>, Vec<_>) = self
             .space
             .elements()
             .filter(|w| Some(*w) != current.as_ref())
+            .filter(|w| stay_in.is_none() || self.ws_of(w) == stay_in)
             .filter_map(|w| Some((w.clone(), self.frame(w)?)))
             .unzip();
         let target = crate::layout::nearest(from, dir, &rects).map(|i| windows[i].clone());
@@ -243,6 +257,8 @@ impl Seven {
         let Some(rect) = self.frame(&window) else {
             return;
         };
+        // moved by hand so its not maximized anymore and unmaximize wont jump it back later
+        self.drop_maximized(&window);
         let (dx, dy) = dir.delta();
         let step = self.config.step;
         let mut moved = Rectangle::new(rect.loc + Point::from((dx * step, dy * step)), rect.size);
@@ -289,24 +305,33 @@ impl Seven {
         }
     }
 
-    /// move a tiles edge out by amount pixels by shifting the split that makes it
-    fn resize_tile(&mut self, window: &Window, dir: Direction, amount: i32) {
+    /// like hyprland the border goes the way of the arrow so its own edge that way or else the one behind it
+    fn move_tile_border(&mut self, window: &Window, dir: Direction) {
+        let step = self.config.step;
+        if !self.resize_tile(window, dir, step) {
+            self.resize_tile(window, dir.opposite(), -step);
+        }
+    }
+
+    /// move a tiles edge out by amount pixels by shifting the split that makes it and says if it had that edge
+    fn resize_tile(&mut self, window: &Window, dir: Direction, amount: i32) -> bool {
         let Some(ws) = self.ws_of(window) else {
-            return;
+            return false;
         };
         let tiled = &self.workspaces[ws].tiled;
         let Some(i) = tiled.iter().position(|(w, _)| w == window) else {
-            return;
+            return false;
         };
         let ratios: Vec<f64> = tiled.iter().map(|(_, ratio)| *ratio).collect();
         let gap = self.config.tiling.gaps_inner;
         let Some((split, span)) = layout::dwindle_edge(self.tile_area(ws), &ratios, gap, i, dir)
         else {
-            return;
+            return false;
         };
         let ratio = &mut self.workspaces[ws].tiled[split].1;
         *ratio = (*ratio + amount as f64 / span).clamp(0.1, 0.9);
         self.retile();
+        true
     }
 
     /// move the windows edge out by amount and keep the other edge still
@@ -318,12 +343,19 @@ impl Seven {
             return;
         }
         if self.is_tiled(&window) {
-            self.resize_tile(&window, dir, amount);
+            // grow and shrink both move the border the way of the arrow in a workspace
+            let dir = if amount < 0 { dir.opposite() } else { dir };
+            self.move_tile_border(&window, dir);
             return;
         }
         let Some(Rectangle { mut loc, size }) = self.frame(&window) else {
             return;
         };
+        // it hasnt drawn yet so theres no size to grow from
+        if size.w <= 0 || size.h <= 0 {
+            return;
+        }
+        self.drop_maximized(&window);
         let mut new_size = size;
         match dir {
             Direction::Left | Direction::Right => new_size.w = (size.w + amount).max(MIN_SIZE),
@@ -343,17 +375,23 @@ impl Seven {
 
     /// fit the windows frame to rect
     pub fn resize_window(&mut self, window: &Window, rect: Rectangle<i32, Logical>) {
+        // a rect w no size is from a window that hadnt drawn yet so the app picks its own
+        let sized = rect.size.w > 0 && rect.size.h > 0;
         let rect = self.content_of(window, rect);
         tracing::debug!(?rect, "resize window");
         if let Some(toplevel) = window.toplevel() {
-            toplevel.with_pending_state(|state| state.size = Some(rect.size));
+            toplevel.with_pending_state(|state| state.size = sized.then_some(rect.size));
             // before its first configure a window gets its size w that configure instead
             if toplevel.is_initial_configure_sent() {
                 toplevel.send_pending_configure();
             }
         }
-        // a space location is where the windows visible part starts
-        self.space.map_element(window.clone(), rect.loc, false);
+        // a space location is where the windows visible part starts and a mapped window keeps its spot in the stack
+        if self.space.element_location(window).is_some() {
+            self.space.relocate_element(window, rect.loc);
+        } else {
+            self.space.map_element(window.clone(), rect.loc, false);
+        }
     }
 
     pub fn is_fullscreen(&self, window: &Window) -> bool {
@@ -380,27 +418,56 @@ impl Seven {
         else {
             return;
         };
-        let before = self.unmaximized_rect(window).unwrap_or(before);
-        self.drop_maximized(window);
-        // fill a screen sized area at the tiles workspace or around the floating window and fly there
+        let now = before;
+        // a maximized tile stays maximized under the fullscreen and a floating one gets maximized again after
+        let was_maximized = !self.is_tiled(window) && self.is_maximized(window);
+        let before = self.unmaximized_rect(window).filter(|_| was_maximized).unwrap_or(before);
+        // keep who maximize already pushed so they can still go back later
+        let mut pushed = window.user_data().get::<Pushed>().map(|p| p.0.take()).unwrap_or_default();
+        if was_maximized {
+            // no configure of its own bc a browser told its unmaximized right before fullscreen thinks its video left fullscreen
+            if let Some(m) = window.user_data().get::<Maximized>() {
+                m.0.take();
+            }
+            toplevel.with_pending_state(|state| state.states.unset(xdg_toplevel::State::Maximized));
+        }
+        window
+            .user_data()
+            .get_or_insert(MaximizedBeforeFullscreen::default)
+            .0
+            .set(was_maximized);
+        // fill a screen sized area at the tiles workspace or grow away from the edge the floating window is snapped to and fly there
         let size = self.screen_size();
-        let loc = match self.ws_of(window) {
-            Some(i) => self.workspaces[i].rect.loc,
+        // another monitor already showing the tiles workspace is the one it fills so this ones view stays put
+        let shown_on = self.ws_of(window).and_then(|i| {
+            let at = (self.workspaces[i].rect.loc.to_f64(), 1.0);
+            self.monitors
+                .iter()
+                .find(|m| m.view.destination() == at)
+                .filter(|_| self.view.destination() != at)
+                .map(|m| crate::monitors::size_of(&m.output))
+        });
+        let screen = match self.ws_of(window) {
+            Some(i) => Rectangle::new(self.workspaces[i].rect.loc, shown_on.unwrap_or(size)),
             None => {
-                let loc = before.loc + Point::from(((before.size.w - size.w) / 2, (before.size.h - size.h) / 2));
-                match self.bounds() {
-                    Some(bounds) => layout::clamp_into(Rectangle::new(loc, size), bounds),
-                    None => loc,
+                let screen = self.spot_from(now, size);
+                for (other, from, to) in self.push_snapped(window, now, screen) {
+                    self.place_frame(&other, to, false);
+                    match pushed.iter_mut().find(|(w, _, _)| *w == other) {
+                        Some(p) => p.2 = to,
+                        None => pushed.push((other, from, to)),
+                    }
                 }
+                screen
             }
         };
-        let screen = Rectangle::new(loc, size);
+        *window.user_data().get_or_insert(Pushed::default).0.borrow_mut() = pushed;
         let view = self.view.destination();
         window
             .user_data()
             .get_or_insert(ViewBeforeFullscreen::default)
             .0
-            .set(Some(view));
+            .set(shown_on.is_none().then_some(view));
         self.fullscreen.retain(|(w, _)| w != window);
         self.fullscreen.push((window.clone(), before));
         toplevel.with_pending_state(|state| {
@@ -408,16 +475,22 @@ impl Seven {
             state.size = Some(screen.size);
         });
         toplevel.send_pending_configure();
-        self.space.map_element(window.clone(), screen.loc, true);
-        self.focus(Some(window));
-        let duration = std::time::Duration::from_millis(self.config.view.fly_duration_ms);
-        self.view.fly_to(screen.loc.to_f64(), 1.0, duration);
+        // it keeps its spot in the stack so whatever floats over it still does
+        self.space.relocate_element(window, screen.loc);
+        self.cycle = None;
+        self.focus_hovered(window);
+        self.restack();
+        if shown_on.is_none() {
+            let duration = std::time::Duration::from_millis(self.config.view.fly_duration_ms);
+            self.view.fly_to(screen.loc.to_f64(), 1.0, duration);
+        }
     }
 
     pub fn unfullscreen(&mut self, window: &Window) {
         let Some(i) = self.fullscreen.iter().position(|(w, _)| w == window) else {
             return;
         };
+        self.view_back_from_fullscreen(window);
         let (_, before) = self.fullscreen.remove(i);
         if let Some(toplevel) = window.toplevel() {
             toplevel.with_pending_state(|state| {
@@ -425,15 +498,42 @@ impl Seven {
                 state.fullscreen_output = None;
             });
         }
+        let remaximize = window
+            .user_data()
+            .get::<MaximizedBeforeFullscreen>()
+            .is_some_and(|m| m.0.take());
         if self.is_tiled(window) {
             self.retile();
         } else {
-            self.resize_window(window, before);
+            self.pull_back_pushed(window);
+            if remaximize {
+                self.maximize_floating(window, before, None);
+            } else {
+                self.resize_window(window, before);
+            }
         }
-        if let Some((camera, zoom)) = window
+    }
+
+    /// leave fullscreen without flying the view back
+    pub fn unfullscreen_in_place(&mut self, window: &Window) {
+        if let Some(v) = window.user_data().get::<ViewBeforeFullscreen>() {
+            v.0.take();
+        }
+        self.unfullscreen(window);
+    }
+
+    /// fly back to where the view was before the window went fullscreen but only if ur still looking at it
+    pub fn view_back_from_fullscreen(&mut self, window: &Window) {
+        let before = window
             .user_data()
             .get::<ViewBeforeFullscreen>()
-            .and_then(|v| v.0.take())
+            .and_then(|v| v.0.take());
+        let looking = self
+            .space
+            .element_location(window)
+            .is_some_and(|loc| self.view.destination() == (loc.to_f64(), 1.0));
+        if let Some((camera, zoom)) = before
+            && looking
         {
             let duration = Duration::from_millis(self.config.view.fly_duration_ms);
             self.view.fly_to(camera, zoom, duration);
@@ -473,6 +573,11 @@ impl Seven {
 
     /// floating windows fill the screen minus panels and tiles fill their workspace
     pub fn maximize(&mut self, window: &Window) {
+        self.maximize_into(window, None);
+    }
+
+    /// maximize but a floating window can be told exactly where to fill
+    pub fn maximize_into(&mut self, window: &Window, area: Option<Rectangle<i32, Logical>>) {
         let Some(toplevel) = window.toplevel() else {
             return;
         };
@@ -502,7 +607,21 @@ impl Seven {
         let Some(before) = self.frame(window) else {
             return;
         };
-        let area = self.maximize_spot(before);
+        self.maximize_floating(window, before, area);
+        self.focus(Some(window));
+    }
+
+    /// fill area or the spot around before and remember before as where it goes back to
+    fn maximize_floating(
+        &mut self,
+        window: &Window,
+        before: Rectangle<i32, Logical>,
+        area: Option<Rectangle<i32, Logical>>,
+    ) {
+        let Some(toplevel) = window.toplevel() else {
+            return;
+        };
+        let area = area.unwrap_or_else(|| self.maximize_spot(before));
         let pushed = self.push_snapped(window, before, area);
         for (other, _, to) in &pushed {
             self.place_frame(other, *to, false);
@@ -515,7 +634,6 @@ impl Seven {
         *window.user_data().get_or_insert(Pushed::default).0.borrow_mut() = pushed;
         toplevel.with_pending_state(|state| state.states.set(xdg_toplevel::State::Maximized));
         self.resize_window(window, area);
-        self.focus(Some(window));
     }
 
     pub fn unmaximize(&mut self, window: &Window) {
@@ -523,6 +641,9 @@ impl Seven {
             return;
         };
         let before = window.user_data().get::<Maximized>().and_then(|m| m.0.take());
+        if let Some(m) = window.user_data().get::<MaximizedBeforeFullscreen>() {
+            m.0.set(false);
+        }
         toplevel.with_pending_state(|state| state.states.unset(xdg_toplevel::State::Maximized));
         match before {
             // a tile goes back into its layout
@@ -564,14 +685,23 @@ impl Seven {
         Some(self.maximize_spot(before))
     }
 
-    /// a screen sized rect minus panels that grows away from a workspace edge the window was snapped to or else from its middle
+    /// a screen sized rect minus panels placed by spot_from
     fn maximize_spot(&self, before: Rectangle<i32, Logical>) -> Rectangle<i32, Logical> {
+        self.spot_from(before, self.maximize_size())
+    }
+
+    /// how big a floating maximized window is so the screen minus panels and outer gaps
+    pub fn maximize_size(&self) -> Size<i32, Logical> {
         let zone = self.usable_screen();
         let gap = self.config.tiling.gaps_outer;
-        let size: Size<i32, Logical> = Size::from((
+        Size::from((
             (zone.size.w as i32 - 2 * gap).max(1),
             (zone.size.h as i32 - 2 * gap).max(1),
-        ));
+        ))
+    }
+
+    /// a rect of this size that grows away from a workspace edge the window was snapped to or else from its middle
+    fn spot_from(&self, before: Rectangle<i32, Logical>, size: Size<i32, Logical>) -> Rectangle<i32, Logical> {
         let snap_gap = self.config.snap.gap;
         let areas = self.ws_areas();
         let stuck = |side: Direction| areas.iter().any(|a| layout::beside(before, *a, side, snap_gap));
@@ -634,7 +764,7 @@ impl Seven {
     }
 
     /// windows pushed out by maximize go back if nobody moved them since
-    fn pull_back_pushed(&mut self, window: &Window) {
+    pub fn pull_back_pushed(&mut self, window: &Window) {
         let Some(pushed) = window.user_data().get::<Pushed>().map(|p| p.0.take()) else {
             return;
         };
@@ -675,6 +805,16 @@ impl Seven {
             toplevel.send_pending_configure();
         }
         let menu_on_click = matches!(kind, DragKind::Resize(_));
+        // a floating window picked up by the move starts to wobble from where u grabbed it
+        let a = &self.config.animations;
+        if a.enabled && a.wobbly && matches!(kind, DragKind::Move) && !lift_tile {
+            let at = pointer.current_location();
+            let uv = [
+                (at.x - initial.loc.x as f64) / initial.size.w.max(1) as f64,
+                (at.y - initial.loc.y as f64) / initial.size.h.max(1) as f64,
+            ];
+            crate::wobbly::grab(&window, uv);
+        }
         let grab_window = window.clone();
         let grab = WindowDrag {
             start_data,
@@ -743,7 +883,7 @@ impl Seven {
         }
         // a program that also draws panels like the shell would lose all of them and not get this window back
         let client = window.toplevel().and_then(|t| t.wl_surface().client());
-        let draws_panels = self.outputs().iter().any(|o| {
+        let draws_panels = self.outputs().any(|o| {
             smithay::desktop::layer_map_for_output(o)
                 .layers()
                 .any(|l| l.wl_surface().client() == client)
@@ -810,6 +950,10 @@ impl Seven {
 /// windows maximize pushed out of the way w where they were and where they went
 #[derive(Default)]
 struct Pushed(std::cell::RefCell<Vec<(Window, Point<i32, Logical>, Point<i32, Logical>)>>);
+
+/// a floating window that was maximized when it went fullscreen
+#[derive(Default)]
+struct MaximizedBeforeFullscreen(std::cell::Cell<bool>);
 
 /// a window that asked for fullscreen before it was placed
 #[derive(Default)]

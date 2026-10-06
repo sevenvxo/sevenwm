@@ -1,5 +1,5 @@
 //! sevenwms own menus drawn as one small image
-//! the window menu on mod+right click w close hide volume and tile or float
+//! the window menu on mod+right click w close hide always on top volume and tile or float
 //! the workspace menu on mod+ctrl+right click to renumber make or remove one
 
 use std::cell::Cell;
@@ -8,9 +8,7 @@ use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::memory::MemoryRenderBuffer;
 use smithay::desktop::Window;
 use smithay::input::pointer::{
-    AxisFrame, ButtonEvent, GestureHoldBeginEvent, GestureHoldEndEvent, GesturePinchBeginEvent,
-    GesturePinchEndEvent, GesturePinchUpdateEvent, GestureSwipeBeginEvent, GestureSwipeEndEvent,
-    GestureSwipeUpdateEvent, GrabStartData, MotionEvent, PointerGrab, PointerInnerHandle,
+    AxisFrame, ButtonEvent, GrabStartData, MotionEvent, PointerGrab, PointerInnerHandle,
     RelativeMotionEvent,
 };
 use smithay::reexports::wayland_server::Resource;
@@ -34,6 +32,7 @@ const PER_ROW: u32 = 5;
 enum Item {
     Close,
     HideFromScreencast,
+    AlwaysOnTop,
     Volume,
     ReturnToRegion,
     Float,
@@ -48,9 +47,10 @@ enum Item {
     RemoveWorkspace,
 }
 
-const WINDOW_ITEMS: [Item; 7] = [
+const WINDOW_ITEMS: [Item; 8] = [
     Item::Close,
     Item::HideFromScreencast,
+    Item::AlwaysOnTop,
     Item::Volume,
     Item::ReturnToRegion,
     Item::Float,
@@ -83,6 +83,17 @@ pub fn hidden_from_capture(window: &Window) -> bool {
         .user_data()
         .get::<HiddenFromCapture>()
         .is_some_and(|h| h.0.get())
+}
+
+/// marks a window that stays above the others and cant be tiled
+#[derive(Default)]
+pub struct AlwaysOnTop(pub Cell<bool>);
+
+pub fn always_on_top(window: &Window) -> bool {
+    window
+        .user_data()
+        .get::<AlwaysOnTop>()
+        .is_some_and(|t| t.0.get())
 }
 
 pub struct Menu {
@@ -345,6 +356,13 @@ impl Seven {
                 let flag = window.user_data().get_or_insert(HiddenFromCapture::default);
                 flag.0.set(!flag.0.get());
             }
+            (Item::AlwaysOnTop, Target::Window(window)) => {
+                let flag = window.user_data().get_or_insert(AlwaysOnTop::default);
+                flag.0.set(!flag.0.get());
+                // a tile cant stay on top so it floats where it is
+                self.untile(&window);
+                self.restack();
+            }
             (Item::Volume, _) => {
                 // left half turns it down and right half up and the menu stays open
                 let local_x = self.pointer_screen.x - menu.pos.x as f64;
@@ -440,14 +458,16 @@ impl Seven {
 
     fn menu_item_enabled(&self, item: Item, menu: &Menu) -> bool {
         let tiled = menu.window().is_some_and(|w| self.is_tiled(w));
+        let on_top = menu.window().is_some_and(always_on_top);
         match item {
             Item::Volume => menu.streams.percent.is_some(),
-            Item::ReturnToRegion => !tiled,
+            Item::ReturnToRegion => !tiled && !on_top,
             Item::Float | Item::WorkspaceMenu => tiled,
             Item::Heading => false,
             Item::RemoveWorkspace
             | Item::Close
             | Item::HideFromScreencast
+            | Item::AlwaysOnTop
             | Item::Collapse
             | Item::Numbers(_)
             | Item::NewWorkspace => true,
@@ -456,6 +476,7 @@ impl Seven {
 
     fn menu_label(&self, item: Item, menu: &Menu) -> (String, Option<String>) {
         let window_hidden = menu.window().is_some_and(hidden_from_capture);
+        let on_top = menu.window().is_some_and(always_on_top);
         let number = self
             .menu_workspace(menu)
             .map(|i| self.workspaces[i].number);
@@ -464,6 +485,10 @@ impl Seven {
             Item::HideFromScreencast => (
                 "Hide from screencast".into(),
                 Some(if window_hidden { "on" } else { "off" }.into()),
+            ),
+            Item::AlwaysOnTop => (
+                "Always on top".into(),
+                Some(if on_top { "on" } else { "off" }.into()),
             ),
             Item::Volume => match menu.streams.percent {
                 Some(percent) => ("Volume   \u{2212}".into(), Some(format!("{percent}%   +"))),
@@ -661,62 +686,7 @@ impl PointerGrab<Seven> for MenuGrab {
         handle.frame(data);
     }
 
-    fn gesture_swipe_begin(
-        &mut self,
-        _: &mut Seven,
-        _: &mut PointerInnerHandle<'_, Seven>,
-        _: &GestureSwipeBeginEvent,
-    ) {
-    }
-    fn gesture_swipe_update(
-        &mut self,
-        _: &mut Seven,
-        _: &mut PointerInnerHandle<'_, Seven>,
-        _: &GestureSwipeUpdateEvent,
-    ) {
-    }
-    fn gesture_swipe_end(
-        &mut self,
-        _: &mut Seven,
-        _: &mut PointerInnerHandle<'_, Seven>,
-        _: &GestureSwipeEndEvent,
-    ) {
-    }
-    fn gesture_pinch_begin(
-        &mut self,
-        _: &mut Seven,
-        _: &mut PointerInnerHandle<'_, Seven>,
-        _: &GesturePinchBeginEvent,
-    ) {
-    }
-    fn gesture_pinch_update(
-        &mut self,
-        _: &mut Seven,
-        _: &mut PointerInnerHandle<'_, Seven>,
-        _: &GesturePinchUpdateEvent,
-    ) {
-    }
-    fn gesture_pinch_end(
-        &mut self,
-        _: &mut Seven,
-        _: &mut PointerInnerHandle<'_, Seven>,
-        _: &GesturePinchEndEvent,
-    ) {
-    }
-    fn gesture_hold_begin(
-        &mut self,
-        _: &mut Seven,
-        _: &mut PointerInnerHandle<'_, Seven>,
-        _: &GestureHoldBeginEvent,
-    ) {
-    }
-    fn gesture_hold_end(
-        &mut self,
-        _: &mut Seven,
-        _: &mut PointerInnerHandle<'_, Seven>,
-        _: &GestureHoldEndEvent,
-    ) {
-    }
+    crate::grabs::swallow_gestures!();
 
     fn start_data(&self) -> &GrabStartData<Seven> {
         &self.start_data

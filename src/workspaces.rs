@@ -45,7 +45,7 @@ impl Workspace {
     }
 }
 
-fn centre(rect: Rect) -> Point<f64, Logical> {
+pub fn centre(rect: Rect) -> Point<f64, Logical> {
     Point::from((
         rect.loc.x as f64 + rect.size.w as f64 / 2.0,
         rect.loc.y as f64 + rect.size.h as f64 / 2.0,
@@ -129,7 +129,6 @@ impl Seven {
     pub fn resize_workspaces(&mut self) {
         let sizes: Vec<(String, Size<i32, Logical>)> = self
             .outputs()
-            .iter()
             .map(|o| (o.name(), crate::monitors::size_of(o)))
             .collect();
         for ws in &mut self.workspaces {
@@ -178,6 +177,11 @@ impl Seven {
             return;
         };
         if self.ws_of(&window) == Some(i) {
+            return;
+        }
+        // it cant tile so dont fly off without it
+        if crate::menu::always_on_top(&window) {
+            self.notify("Always on top windows can't go into a workspace");
             return;
         }
         if self.is_fullscreen(&window) {
@@ -316,9 +320,10 @@ impl Seven {
         let old = ws.rect;
         ws.rect.loc = loc;
         let windows: Vec<Window> = ws.tiled.iter().map(|(w, _)| w.clone()).collect();
+        // relocate bc mapping again would raise the tiles over floating windows mid drag
         for window in windows {
             if let Some(at) = self.space.element_location(&window) {
-                self.space.map_element(window, at + delta, false);
+                self.space.relocate_element(&window, at + delta);
             }
         }
         // a fullscreen window on it goes along too
@@ -329,7 +334,7 @@ impl Seven {
             .filter(|w| !self.is_tiled(w) && self.space.element_location(w) == Some(old.loc))
             .collect();
         for window in fullscreen {
-            self.space.map_element(window, loc, false);
+            self.space.relocate_element(&window, loc);
         }
         // and its collapsed tile markers below it
         let number = self.workspaces[i].number;
@@ -361,7 +366,7 @@ impl Seven {
         }
     }
 
-    /// mod+ctrl+drag on a workspace picks it up
+    /// mod+alt+drag on a workspace picks it up
     pub fn start_workspace_drag(&mut self, i: usize, button: u32, serial: smithay::utils::Serial) {
         let Some(pointer) = self.seat.get_pointer() else {
             return;

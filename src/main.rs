@@ -7,6 +7,7 @@ mod collapse;
 mod config;
 mod cursor;
 mod decorations;
+mod display;
 mod grabs;
 mod handlers;
 mod input;
@@ -28,6 +29,7 @@ mod udev;
 mod view;
 mod wallpaper;
 mod winit;
+mod wobbly;
 mod workspaces;
 mod xwayland;
 
@@ -35,6 +37,17 @@ use smithay::reexports::calloop::EventLoop;
 use smithay::reexports::wayland_server::Display;
 
 use state::Seven;
+
+/// the flags sevenwm takes when it starts
+const KNOWN_FLAGS: [&str; 3] = ["--nested", "--hardware", "--greeter"];
+
+const USAGE: &str = "usage: sevenwm [--nested | --hardware] [--greeter] [command]
+  command              run this inside instead of the autostart (kitty when nested)
+  --nested             run as a window inside another compositor (picked on its own)
+  --hardware           take the gpu and monitors even from inside another session
+  --greeter <command>  run the login screen for greetd
+  --check-config [path]  check a config and exit
+  --help, --version";
 
 /// what sevenwm launches inside itself when u give no command
 const DEFAULT_CLIENT: &str = "kitty";
@@ -62,6 +75,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(1);
             }
         }
+    }
+
+    // anything that isnt a flag we know stops here instead of starting a compositor by surprise
+    let flags: Vec<String> = std::env::args().skip(1).filter(|a| a.starts_with('-')).collect();
+    if flags.iter().any(|a| a == "--help" || a == "-h") {
+        println!("{USAGE}");
+        return Ok(());
+    }
+    if flags.iter().any(|a| a == "--version" || a == "-V") {
+        println!("sevenwm {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    if let Some(unknown) = flags.iter().find(|a| !KNOWN_FLAGS.contains(&a.as_str())) {
+        eprintln!("sevenwm: unknown option '{unknown}'\n{USAGE}");
+        std::process::exit(2);
     }
 
     init_logging();
@@ -123,6 +151,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             state.xwayland_tick();
             state.keep_running();
             state.idle_tick();
+            state.night_light_tick();
             state.auto_collapse();
             state.update_surface_scales();
             state.save_session();
